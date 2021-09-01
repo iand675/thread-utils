@@ -1,0 +1,40 @@
+name:                thread-utils-context
+version:             0.1.0.0
+github:              "iand675/thread-utils"
+license:             BSD3
+author:              "Ian Duncan"
+maintainer:          "ian@iankduncan.com"
+copyright:           "2021 Ian Duncan"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+synopsis:            Garbage-collected thread local storage
+category:            Concurrency
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/iand675/thread-utils-context#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- thread-utils-finalizers
+- containers
+- ghc-prim
+
+library:
+  source-dirs: src
+
+tests:
+  thread-utils-context-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - thread-utils-context
