@@ -2,7 +2,7 @@
 {-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE Strict #-}
+{-# LANGUAGE BangPatterns #-}
 -- | A perilous implementation of thread-local storage for Haskell.
 -- This module uses a fair amount of GHC internals to enable performing
 -- lookups of context for any threads that are alive. Caution should be
@@ -158,13 +158,13 @@ detachFromThread tsm tid = liftIO $ do
 -- | The most general function in this library. Update a 'ThreadStorageMap' on a given thread,
 -- with the ability to add or remove values and return some sort of result.
 updateOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> (Maybe a -> (Maybe a, b)) -> m b
-updateOnThread tsm tid f = liftIO $ do
+updateOnThread tsm tid f = liftIO $ mask_ $ do
   -- ^ We mask here in order to ensure that the finalizer will always be created
   (isNewThreadEntry, result) <- atomicModifyStripe tsm threadAsInt $ \m -> 
     let (resultWithNewThreadDetection, m') = 
           I.alterF 
             (\x -> case f x of
-              (x', y) -> ((isNothing x && isJust x', y), x')
+              (!x', !y) -> ((isNothing x && isJust x', y), x')
             ) 
             threadAsInt
             m
