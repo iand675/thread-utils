@@ -215,7 +215,7 @@ storedItems tsm = do
 #if MIN_VERSION_base(4,18,0)
 -- | This should generally not be needed, but may be used to remove values prior to GC-triggered finalizers being run from the 'ThreadStorageMap' for threads that have exited.
 purgeDeadThreads :: MonadIO m => ThreadStorageMap a -> m ()
-purgeDeadThreads tsm = do
+purgeDeadThreads tsm = liftIO $ do
   tids <- listThreads
   let threadSet = IS.fromList $ map getThreadId tids
   forM_ [0..(numStripes - 1)] $ \stripe ->
