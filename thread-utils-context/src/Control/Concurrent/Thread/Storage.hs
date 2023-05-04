@@ -55,7 +55,7 @@ module Control.Concurrent.Thread.Storage
 
 import Control.Concurrent
 import Control.Concurrent.Thread.Finalizers
-import Control.Monad ( when, void )
+import Control.Monad ( when, void, forM_ )
 import Control.Monad.IO.Class
 import Data.Maybe (isNothing, isJust)
 import GHC.Base (Addr#)
