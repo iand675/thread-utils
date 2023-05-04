@@ -1,5 +1,5 @@
 name:                thread-utils-context
-version:             0.1.0.0
+version:             0.2.0.0
 github:              "iand675/thread-utils"
 license:             BSD3
 author:              "Ian Duncan"
@@ -25,8 +25,17 @@ dependencies:
 - containers
 - ghc-prim
 
+flags:
+  debug:
+    description: Whether to enable some additional hooks to debug issues
+    default: false
+    manual: true
+
 library:
   source-dirs: src
+  when:
+    - condition: flag(debug)
+      cpp-options: -DDEBUG_HOOKS
 
 tests:
   thread-utils-context-test:
@@ -38,3 +47,5 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - thread-utils-context
+    - hspec
+    - hspec-expectations

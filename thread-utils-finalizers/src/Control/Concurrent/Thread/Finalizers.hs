@@ -1,12 +1,16 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
-module Control.Concurrent.Thread.Finalizers where
+module Control.Concurrent.Thread.Finalizers
+  ( mkWeakThreadIdWithFinalizer
+  , addThreadFinalizer
+  , finalizeThread
+  ) where
 import Control.Concurrent
 import Control.Exception
 import Control.Monad ( void )
 import GHC.IO (IO(..))
 import GHC.Prim ( mkWeak# )
-import GHC.Weak ( Weak(..) )
+import GHC.Weak ( Weak(..), finalize )
 import GHC.Conc.Sync ( ThreadId(..) )
 
 -- | A variant of 'Control.Concurrent.mkWeakThreadId' that supports
@@ -40,3 +44,11 @@ mkWeakThreadIdWithFinalizer t@(ThreadId t#) (IO finalizer) = IO $ \s ->
 -}
 addThreadFinalizer :: ThreadId -> IO () -> IO ()
 addThreadFinalizer tid m = void $ mkWeakThreadIdWithFinalizer tid m
+
+{-|
+  Run a thread's finalizers. This is just a convenience alias for 'System.Mem.Weak.finalize'.
+
+  The thread can still be used afterwards, it will simply not run the associated finalizers again.
+-}
+finalizeThread :: Weak ThreadId -> IO ()
+finalizeThread = finalize
