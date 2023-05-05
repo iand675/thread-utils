@@ -1,10 +1,10 @@
 name:                thread-utils-context
-version:             0.3.0.2
+version:             0.3.0.3
 github:              "iand675/thread-utils"
 license:             BSD3
 author:              "Ian Duncan"
 maintainer:          "ian@iankduncan.com"
-copyright:           "2021 Ian Duncan"
+copyright:           "2023 Ian Duncan"
 
 extra-source-files:
 - README.md

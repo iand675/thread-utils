@@ -218,7 +218,7 @@ storedItems tsm = do
 purgeDeadThreads :: MonadIO m => ThreadStorageMap a -> m ()
 purgeDeadThreads tsm = liftIO $ do
   tids <- listThreads
-  let threadSet = IS.fromList $ map getThreadId tids
+  let threadSet = IS.fromList $ map (fromIntegral . getThreadId) tids
   forM_ [0..(numStripes - 1)] $ \stripe ->
     atomicModifyStripe tsm stripe $ \im -> (I.restrictKeys im threadSet, ())
 #endif

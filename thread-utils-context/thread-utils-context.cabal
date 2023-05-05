@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           thread-utils-context
-version:        0.3.0.2
+version:        0.3.0.3
 synopsis:       Garbage-collected thread local storage
 description:    Please see the README on GitHub at <https://github.com/iand675/thread-utils-context#readme>
 category:       Concurrency
@@ -13,7 +13,7 @@ homepage:       https://github.com/iand675/thread-utils#readme
 bug-reports:    https://github.com/iand675/thread-utils/issues
 author:         Ian Duncan
 maintainer:     ian@iankduncan.com
-copyright:      2021 Ian Duncan
+copyright:      2023 Ian Duncan
 license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
