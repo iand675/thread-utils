@@ -58,6 +58,7 @@ import Control.Concurrent.Thread.Finalizers
 import Control.Monad ( when, void, forM_ )
 import Control.Monad.IO.Class
 import Data.Maybe (isNothing, isJust)
+import Data.Word (Word64)
 import GHC.Base (Addr#)
 import GHC.IO (IO(..), mask_)
 import GHC.Int
@@ -74,24 +75,24 @@ import Unsafe.Coerce (unsafeCoerce#)
 
 foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: Addr# -> CULLong
 
-numStripes :: Int
+numStripes :: Word
 numStripes = 32
 
-getThreadId :: ThreadId -> Int
+getThreadId :: ThreadId -> Word
 getThreadId (ThreadId tid#) = fromIntegral (c_getThreadId (unsafeCoerce# tid#))
 
-stripeHash :: Int -> Int
-stripeHash = (`mod` numStripes) . abs
+stripeHash :: Word -> Int
+stripeHash = fromIntegral . (`mod` numStripes)
 
 readStripe :: ThreadStorageMap a -> ThreadId -> IO (I.IntMap a)
 readStripe (ThreadStorageMap arr#) t = IO $ \s -> readArray# arr# tid# s
   where
     (I# tid#) = stripeHash $ getThreadId t
 
-atomicModifyStripe :: ThreadStorageMap a -> Int -> (I.IntMap a -> (I.IntMap a, b)) -> IO b
+atomicModifyStripe :: ThreadStorageMap a -> Word -> (I.IntMap a -> (I.IntMap a, b)) -> IO b
 atomicModifyStripe (ThreadStorageMap arr#) tid f = IO $ \s -> go s
   where
-    (I# stripe#) = stripeHash tid
+    (I# stripe#) = fromIntegral $ stripeHash tid
     go s = case readArray# arr# stripe# s of
       (# s1, intMap #) ->
         let (updatedIntMap, result) = f intMap 
@@ -113,7 +114,7 @@ newThreadStorageMap
 newThreadStorageMap = liftIO $ IO $ \s -> case newArray# numStripes# mempty s of
   (# s1, ma #) -> (# s1, ThreadStorageMap ma #)
   where
-    (I# numStripes#) = numStripes
+    (I# numStripes#) = fromIntegral numStripes
 
 -- | Retrieve a value if it exists for the current thread
 lookup :: MonadIO m => ThreadStorageMap a -> m (Maybe a)
@@ -127,7 +128,7 @@ lookupOnThread tsm tid = liftIO $ do
   m <- readStripe tsm tid
   pure $ I.lookup threadAsInt m
   where 
-    threadAsInt = getThreadId tid
+    threadAsInt = fromIntegral $ getThreadId tid
 
 -- | Associate the provided value with the current thread.
 --
@@ -160,20 +161,20 @@ detachFromThread tsm tid = liftIO $ do
 updateOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> (Maybe a -> (Maybe a, b)) -> m b
 updateOnThread tsm tid f = liftIO $ mask_ $ do
   -- ^ We mask here in order to ensure that the finalizer will always be created
-  (isNewThreadEntry, result) <- atomicModifyStripe tsm threadAsInt $ \m -> 
+  (isNewThreadEntry, result) <- atomicModifyStripe tsm threadAsWord $ \m -> 
     let (resultWithNewThreadDetection, m') = 
           I.alterF 
             (\x -> case f x of
               (!x', !y) -> ((isNothing x && isJust x', y), x')
             ) 
-            threadAsInt
+            (fromIntegral threadAsWord)
             m
      in (m', resultWithNewThreadDetection)
   when isNewThreadEntry $ do
-    addThreadFinalizer tid $ cleanUp tsm threadAsInt
+    addThreadFinalizer tid $ cleanUp tsm threadAsWord
   pure result
   where 
-    threadAsInt = getThreadId tid
+    threadAsWord = getThreadId tid
 
 update :: MonadIO m => ThreadStorageMap a -> (Maybe a -> (Maybe a, b)) -> m b
 update tsm f = liftIO $ do
@@ -189,15 +190,15 @@ adjust tsm f = liftIO $ do
 -- | Update the associated value for the specified thread if it is attached.
 adjustOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> (a -> a) -> m ()
 adjustOnThread tsm tid f = liftIO $ do
-  atomicModifyStripe tsm threadAsInt $ \m -> (I.adjust f threadAsInt m, ())
+  atomicModifyStripe tsm threadAsWord $ \m -> (I.adjust f (fromIntegral threadAsWord) m, ())
   where 
-    threadAsInt = getThreadId tid 
+    threadAsWord = getThreadId tid 
 
 -- Remove this context for thread from the map on finalization
-cleanUp :: ThreadStorageMap a -> Int -> IO ()
+cleanUp :: ThreadStorageMap a -> Word -> IO ()
 cleanUp tsm tid = do
   atomicModifyStripe tsm tid $ \m -> 
-    (I.delete tid m, ())
+    (I.delete (fromIntegral tid) m, ())
 
 -- | List thread ids with live entries in the 'ThreadStorageMap'.
 -- 
@@ -206,7 +207,7 @@ cleanUp tsm tid = do
 -- items from being freed from a 'ThreadStorageMap' 
 storedItems :: ThreadStorageMap a -> IO [(Int, a)]
 storedItems tsm = do
-  stripes <- mapM (stripeByIndex tsm) [0..(numStripes - 1)]
+  stripes <- mapM (stripeByIndex tsm) [0..(fromIntegral numStripes - 1)]
   pure $ concatMap I.toList stripes
   where
     stripeByIndex :: ThreadStorageMap a -> Int -> IO (I.IntMap a)
