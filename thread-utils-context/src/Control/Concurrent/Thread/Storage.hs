@@ -71,7 +71,7 @@ import qualified Data.IntMap.Strict as I
 import qualified Data.IntSet as IS
 import Foreign.C.Types
 import Prelude hiding (lookup)
-import Unsafe.Coerce (unsafeCoerce#)
+import GHC.Exts (unsafeCoerce#)
 
 foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: Addr# -> CULLong
 
