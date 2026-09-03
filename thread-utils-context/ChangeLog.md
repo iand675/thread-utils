@@ -1,5 +1,10 @@
 # Changelog for thread-utils-context
 
+## 0.4.1.1
+
+- Fix `purgeDeadThreads` retaining finished threads and evicting live ones.
+- Stop `purgeDeadThreads` from retaining stale TSO pointers after collection.
+
 ## 0.4.1.0
 
 - Fix space leak: repeated `attach`/`detach` on long-lived threads no longer
