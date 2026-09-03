@@ -23,9 +23,19 @@
  * `sorted` must be in ascending order.  The comparison `base[half] <
  * needle` compiles to CMOV on both x86-64 and AArch64 at -O2, so no
  * branch mispredictions.
+ *
+ * The loop narrows to a lower-bound *candidate*, not to the answer: on
+ * exit the lower bound is either `base` or `base + 1`.  Lemire's original
+ * returns the index `(*base < target) + (base - source)` precisely to
+ * account for that.  Both slots must therefore be compared here --
+ * testing only `*base` reports "absent" for almost every element that is
+ * actually present (e.g. 199 of 200 for a contiguous run), because the
+ * loop most often stops one short.
  * ------------------------------------------------------------------- */
 static inline int contains_bsearch(HsInt needle,
                                    const HsInt *sorted, HsInt n) {
+    if (n <= 0)
+        return 0;
     const HsInt *base = sorted;
     HsInt len = n;
     while (len > 1) {
@@ -33,7 +43,10 @@ static inline int contains_bsearch(HsInt needle,
         base += (base[half] < needle) ? half : 0;
         len -= half;
     }
-    return (n > 0) && (*base == needle);
+    if (*base == needle)
+        return 1;
+    const HsInt *next = base + 1;
+    return (next < sorted + n) && (*next == needle);
 }
 
 /* -------------------------------------------------------------------

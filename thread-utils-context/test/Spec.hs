@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE NumericUnderscores #-}
 import System.Mem
 import Control.Concurrent
@@ -226,6 +227,75 @@ main = hspec $ do
       -- Fixed code => bounded constant (one Weak# per thread).
       let growth = fromIntegral afterLive - fromIntegral beforeLive :: Int
       growth `shouldSatisfy` (< 1_000_000)
+
+#if MIN_VERSION_base(4,18,0)
+  describe "purgeDeadThreads" $ do
+    it "reclaims entries for exited threads without waiting for GC" $ do
+      let n = 500
+      gate <- newEmptyMVar
+      doneRef <- newIORef (0 :: Int)
+      tsm <- newThreadStorageMap
+      replicateM_ n $ forkIO $ do
+        attach tsm ()
+        readMVar gate
+        atomicModifyIORef' doneRef (\x -> (x + 1, ()))
+
+      waitForCount tsm n
+      putMVar gate ()
+      spinUntil $ (>= n) <$> readIORef doneRef
+
+      -- The whole point of purgeDeadThreads is to reclaim eagerly rather
+      -- than waiting on GC finalizers, so spin without performGC here.
+      spinUntil $ do
+        purgeDeadThreads tsm
+        null <$> storedItems tsm
+
+      leftovers <- storedItems tsm
+      leftovers `shouldBe` []
+
+    it "keeps entries for threads that are still alive" $ do
+      let n = 200
+      gate <- newEmptyMVar
+      tsm <- newThreadStorageMap
+      replicateM_ n $ forkIO $ do
+        attach tsm ()
+        readMVar gate
+
+      waitForCount tsm n
+      purgeDeadThreads tsm
+      survivors <- storedItems tsm
+      putMVar gate ()
+      length survivors `shouldBe` n
+
+    -- Regression test for a laundered TSO pointer in getThreadIdInt.
+    --
+    -- purgeDeadThreads calls listThreads and converts every ThreadId in the
+    -- process to its numeric id. That conversion used to coerce ThreadId# to
+    -- Addr# before handing it to rts_getThreadId. ThreadId# is a movable heap
+    -- pointer, so once laundered into a non-pointer slot the collector would
+    -- neither trace nor relocate it; a GC landing mid-traversal left the C
+    -- call dereferencing a stale TSO and the process segfaulted.
+    --
+    -- This is a race, so it is probabilistic rather than deterministic: many
+    -- live threads (a long listThreads result) interleaved with forced GCs
+    -- is the shape that reproduces it.
+    it "tolerates GC relocating TSOs during the live-thread scan" $ do
+      let n = 2_000
+      gate <- newEmptyMVar
+      tsm <- newThreadStorageMap
+      replicateM_ n $ forkIO $ do
+        attach tsm (0 :: Int)
+        readMVar gate
+
+      waitForCount tsm n
+      replicateM_ 100 $ do
+        performGC
+        purgeDeadThreads tsm
+
+      survivors <- storedItems tsm
+      putMVar gate ()
+      length survivors `shouldBe` n
+#endif
 
 
 waitForCount :: ThreadStorageMap a -> Int -> IO ()
