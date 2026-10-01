@@ -33,17 +33,17 @@ static int g_checks = 0;
  * ------------------------------------------------------------------- */
 
 /* 1, 2, 3, ..., n */
-static void contiguous(HsInt n, HsInt *out) {
+static void contiguous(HsInt n, HsInt64 *out) {
     for (HsInt i = 0; i < n; i++) out[i] = i + 1;
 }
 
 /* 7, 14, 21, ..., 7n -- exercises non-contiguous gaps */
-static void strided(HsInt n, HsInt *out) {
+static void strided(HsInt n, HsInt64 *out) {
     for (HsInt i = 0; i < n; i++) out[i] = (i + 1) * 7;
 }
 
 /* 1, 1, 1, 2, 2, 2, ... -- exercises repeated values */
-static void with_duplicates(HsInt n, HsInt *out) {
+static void with_duplicates(HsInt n, HsInt64 *out) {
     for (HsInt i = 0; i < n; i++) out[i] = (i / 3) + 1;
 }
 
@@ -53,13 +53,13 @@ static void with_duplicates(HsInt n, HsInt *out) {
  * reference membership check (correct by construction, since it's
  * just a linear scan over the array the caller built).
  * ------------------------------------------------------------------- */
-static int hsint_in_array(HsInt v, const HsInt *xs, HsInt n) {
+static int hsint_in_array(HsInt64 v, const HsInt64 *xs, HsInt n) {
     for (HsInt i = 0; i < n; i++)
         if (xs[i] == v) return 1;
     return 0;
 }
 
-static void check_needle(const char *label, HsInt needle, const HsInt *xs, HsInt n) {
+static void check_needle(const char *label, HsInt64 needle, const HsInt64 *xs, HsInt n) {
     int expected = hsint_in_array(needle, xs, n);
     int actual = contains(needle, xs, n) != 0;
     CHECK(actual == expected,
@@ -67,14 +67,14 @@ static void check_needle(const char *label, HsInt needle, const HsInt *xs, HsInt
           label, (long long)needle, (long long)n, actual, expected);
 }
 
-static void check_array(const char *label, const HsInt *xs, HsInt n) {
+static void check_array(const char *label, const HsInt64 *xs, HsInt n) {
     for (HsInt i = 0; i < n; i++) {
         check_needle(label, xs[i] - 1, xs, n);
         check_needle(label, xs[i], xs, n);
         check_needle(label, xs[i] + 1, xs, n);
     }
-    check_needle(label, HS_INT_MIN, xs, n);
-    check_needle(label, HS_INT_MAX, xs, n);
+    check_needle(label, HS_INT64_MIN, xs, n);
+    check_needle(label, HS_INT64_MAX, xs, n);
     check_needle(label, 0, xs, n);
     check_needle(label, -1, xs, n);
     check_needle(label, 1, xs, n);
@@ -91,42 +91,44 @@ static const HsInt SIZES[] = {
 /* -------------------------------------------------------------------
  * purge_find_dead / purge_filter_live: exercise the dead_out layout,
  * empty/tombstone skipping, flag-bit masking, and the second-snapshot
- * rescue. Mirrors the constants in Storage.hs.
+ * rescue. Mirrors the constants in Storage.hs: the flags occupy the top
+ * three bits of the word and the thread ID everything below them.
  * ------------------------------------------------------------------- */
-#define TOMBSTONE     ((HsInt)1 << 63)
-#define DETACHED_BIT  ((HsInt)1 << 32)
-#define CLAIMING_BIT  ((HsInt)1 << 33)
+#define TOMBSTONE     ((HsInt64)1 << 63)
+#define CLAIMING_BIT  ((HsInt64)1 << 62)
+#define DETACHED_BIT  ((HsInt64)1 << 61)
 #define KEY_MASK      (DETACHED_BIT - 1)
-#define VERSION(n)    ((HsInt)(n) << 34)
-#define TOMB_MASK     (~(VERSION(0x1FFFFFFF)))   /* everything but bits 34..62 */
+#define WIDE(n)       (((HsInt64)1 << 32) | (n))  /* an ID past 2^32 */
 
 static void check_purge_scan(void) {
     enum { CAP = 16 };
-    HsInt keys[CAP];
+    HsInt64 keys[CAP];
     memset(keys, 0, sizeof keys);
-    keys[1]  = 10 | VERSION(3);           /* live, attached, versioned   */
+    keys[1]  = 10;                        /* live, attached              */
     keys[2]  = 11 | DETACHED_BIT;         /* live, detached              */
     keys[3]  = 20;                        /* dead                        */
     keys[4]  = 21 | DETACHED_BIT;         /* dead, detached              */
-    keys[5]  = TOMBSTONE | VERSION(7);    /* skipped despite its version */
+    keys[5]  = WIDE(10);                  /* dead; low 32 bits are live  */
     keys[6]  = 22 | CLAIMING_BIT;         /* dead, mid-claim (reported)  */
-    keys[7]  = 30 | VERSION(1);           /* born after snapshot 1       */
+    keys[7]  = 30;                        /* born after snapshot 1       */
     keys[8]  = TOMBSTONE;                 /* skipped                     */
     keys[9]  = 12;                        /* live                        */
+    keys[10] = WIDE(12) | DETACHED_BIT;   /* live past 2^32, detached    */
 
-    HsInt live1[] = { 12, 10, 11 };       /* unsorted on purpose         */
-    HsInt dead_out[2 * CAP + 1];
+    HsInt64 live1[] = { 12, 10, WIDE(12), 11 };  /* unsorted on purpose  */
+    HsInt64 dead_out[2 * CAP + 1];
     memset(dead_out, 0x55, sizeof dead_out);
 
-    HsInt n = purge_find_dead(keys, CAP, live1, 3, TOMBSTONE, TOMB_MASK, KEY_MASK, dead_out);
-    CHECK(n == 4, "purge_find_dead: count = %lld, expected 4", (long long)n);
-    CHECK(dead_out[0] == 7, "purge_find_dead: occupied = %lld, expected 7", (long long)dead_out[0]);
-    CHECK(live1[0] == 10 && live1[1] == 11 && live1[2] == 12, "purge_find_dead: live set not sorted");
+    HsInt n = purge_find_dead(keys, CAP, live1, 4, TOMBSTONE, KEY_MASK, dead_out);
+    CHECK(n == 5, "purge_find_dead: count = %lld, expected 5", (long long)n);
+    CHECK(dead_out[0] == 9, "purge_find_dead: occupied = %lld, expected 9", (long long)dead_out[0]);
+    CHECK(live1[0] == 10 && live1[1] == 11 && live1[2] == 12 && live1[3] == WIDE(12),
+          "purge_find_dead: live set not sorted");
 
     /* Entries are in slot order with the observed key word, flags intact. */
-    const HsInt exp_slots[] = { 3, 4, 6, 7 };
-    const HsInt exp_keys[]  = { 20, 21 | DETACHED_BIT, 22 | CLAIMING_BIT, 30 | VERSION(1) };
-    for (HsInt i = 0; i < n && i < 4; i++) {
+    const HsInt64 exp_slots[] = { 3, 4, 5, 6, 7 };
+    const HsInt64 exp_keys[]  = { 20, 21 | DETACHED_BIT, WIDE(10), 22 | CLAIMING_BIT, 30 };
+    for (HsInt i = 0; i < n && i < 5; i++) {
         CHECK(dead_out[1 + 2 * i] == exp_slots[i],
               "purge_find_dead: entry %lld slot = %lld, expected %lld",
               (long long)i, (long long)dead_out[1 + 2 * i], (long long)exp_slots[i]);
@@ -136,12 +138,12 @@ static void check_purge_scan(void) {
     }
 
     /* Second snapshot: 30 has appeared. It must be rescued; the rest stay. */
-    HsInt live2[] = { 30, 12, 11, 10 };
-    HsInt kept = purge_filter_live(dead_out, n, live2, 4, KEY_MASK);
-    CHECK(kept == 3, "purge_filter_live: kept = %lld, expected 3", (long long)kept);
-    CHECK(dead_out[0] == 7, "purge_filter_live: clobbered dead_out[0]");
-    const HsInt exp_slots2[] = { 3, 4, 6 };
-    for (HsInt i = 0; i < kept && i < 3; i++) {
+    HsInt64 live2[] = { 30, 12, 11, 10, WIDE(12) };
+    HsInt kept = purge_filter_live(dead_out, n, live2, 5, KEY_MASK);
+    CHECK(kept == 4, "purge_filter_live: kept = %lld, expected 4", (long long)kept);
+    CHECK(dead_out[0] == 9, "purge_filter_live: clobbered dead_out[0]");
+    const HsInt64 exp_slots2[] = { 3, 4, 5, 6 };
+    for (HsInt i = 0; i < kept && i < 4; i++) {
         CHECK(dead_out[1 + 2 * i] == exp_slots2[i],
               "purge_filter_live: entry %lld slot = %lld, expected %lld",
               (long long)i, (long long)dead_out[1 + 2 * i], (long long)exp_slots2[i]);
@@ -150,14 +152,14 @@ static void check_purge_scan(void) {
     }
 
     /* Empty live set: everything occupied is dead. */
-    HsInt n0 = purge_find_dead(keys, CAP, live1, 0, TOMBSTONE, TOMB_MASK, KEY_MASK, dead_out);
-    CHECK(n0 == 7, "purge_find_dead(n_live=0): count = %lld, expected 7", (long long)n0);
+    HsInt n0 = purge_find_dead(keys, CAP, live1, 0, TOMBSTONE, KEY_MASK, dead_out);
+    CHECK(n0 == 9, "purge_find_dead(n_live=0): count = %lld, expected 9", (long long)n0);
     HsInt kept0 = purge_filter_live(dead_out, n0, live1, 0, KEY_MASK);
-    CHECK(kept0 == 7, "purge_filter_live(n_live=0): kept = %lld, expected 7", (long long)kept0);
+    CHECK(kept0 == 9, "purge_filter_live(n_live=0): kept = %lld, expected 9", (long long)kept0);
 }
 
 int main(void) {
-    static HsInt buf[8 * LINEAR_THRESHOLD];
+    static HsInt64 buf[8 * LINEAR_THRESHOLD];
     char label[64];
 
     for (size_t i = 0; i < sizeof(SIZES) / sizeof(SIZES[0]); i++) {

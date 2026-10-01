@@ -185,6 +185,27 @@ main = hspec $ do
       let expected = fmap Just [1 .. n]
       sort results `shouldBe` sort expected
 
+  -- GHC's thread IDs are a 64-bit counter. A long-running process passes
+  -- 2^32 of them, and the main thread (or any long-lived worker) shares
+  -- its low 32 bits with every ID 2^32 further on.
+  describe "thread IDs past 2^32" $ do
+    it "keep their own entry, apart from the ID that shares their low bits" $ do
+      tsm <- newThreadStorageMap
+      me <- myThreadId
+      let low = getThreadId me
+          wide = low + 2 ^ (32 :: Int)
+      _ <- attach tsm (1 :: Int)
+      updateRaw tsm me wide (\_ -> (Just 2, ()))
+      lookup tsm `shouldReturn` Just 1
+      lookupRaw tsm low `shouldReturn` Just 1
+      lookupRaw tsm wide `shouldReturn` Just 2
+      _ <- detach tsm
+      lookupRaw tsm wide `shouldReturn` Just 2
+      _ <- updateRaw tsm me wide (\_ -> (Nothing, ()))
+      attach tsm 3 `shouldReturn` Nothing
+      lookupRaw tsm wide `shouldReturn` Nothing
+      lookup tsm `shouldReturn` Just 3
+
   describe "space leak" $ do
     it "repeated attach/detach does not accumulate weak pointers" $ do
       enabled <- getRTSStatsEnabled
@@ -343,14 +364,21 @@ main = hspec $ do
             readIORef ref >>= check i . Just
           putMVar done ()
         _ <- forkIO $ do
-          let loop = do
+          -- A probe that misses allocates nothing, so a loop of misses has
+          -- no safepoint: it can't be preempted and it stalls every GC
+          -- until its key reappears, which never happens once the other
+          -- capabilities have stopped. Yielding every 64 iterations gives
+          -- it a safepoint without a context switch on every pass.
+          let loop :: Int -> IO ()
+              loop !n = do
                 s <- readIORef stop
                 unless s $ do
                   lookupRaw tsm k >>= check i
                   mref <- lookupRef tsm kInt
                   forM_ mref $ \r -> readIORef r >>= check i . Just
-                  loop
-          loop
+                  when (n `rem` 64 == 0) yield
+                  loop (n + 1)
+          loop 1
           putMVar done ()
         pure ()
       finished <- timeout 60_000_000 $ do
@@ -361,7 +389,8 @@ main = hspec $ do
       readIORef bad >>= (`shouldBe` 0)
       readIORef exc >>= (`shouldBe` 0)
 
-    -- Regression test for a laundered TSO pointer in getThreadIdInt.
+    -- Regression test for a laundered TSO pointer in threadKey (formerly
+    -- getThreadIdInt).
     --
     -- purgeDeadThreads calls listThreads and converts every ThreadId in the
     -- process to its numeric id. That conversion used to coerce ThreadId# to

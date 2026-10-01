@@ -32,11 +32,11 @@
  * actually present (e.g. 199 of 200 for a contiguous run), because the
  * loop most often stops one short.
  * ------------------------------------------------------------------- */
-static inline int contains_bsearch(HsInt needle,
-                                   const HsInt *sorted, HsInt n) {
+static inline int contains_bsearch(HsInt64 needle,
+                                   const HsInt64 *sorted, HsInt n) {
     if (n <= 0)
         return 0;
-    const HsInt *base = sorted;
+    const HsInt64 *base = sorted;
     HsInt len = n;
     while (len > 1) {
         HsInt half = len >> 1;
@@ -45,7 +45,7 @@ static inline int contains_bsearch(HsInt needle,
     }
     if (*base == needle)
         return 1;
-    const HsInt *next = base + 1;
+    const HsInt64 *next = base + 1;
     return (next < sorted + n) && (*next == needle);
 }
 
@@ -58,8 +58,8 @@ static inline int contains_bsearch(HsInt needle,
 
 #if defined(__aarch64__)
 
-static inline int contains_linear(HsInt needle,
-                                  const HsInt *hay, HsInt n) {
+static inline int contains_linear(HsInt64 needle,
+                                  const HsInt64 *hay, HsInt n) {
     int64x2_t vn = vdupq_n_s64(needle);
     HsInt i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -91,8 +91,8 @@ static inline int contains_linear(HsInt needle,
  *   4. AND (both halves must be zero for 64-bit equality)
  *   5. movemask to scalar
  */
-static inline int contains_linear(HsInt needle,
-                                  const HsInt *hay, HsInt n) {
+static inline int contains_linear(HsInt64 needle,
+                                  const HsInt64 *hay, HsInt n) {
     __m128i vn   = _mm_set1_epi64x(needle);
     __m128i zero = _mm_setzero_si128();
     HsInt i = 0;
@@ -125,8 +125,8 @@ static inline int contains_linear(HsInt needle,
 
 #else /* scalar fallback for s390x, riscv64, powerpc64, etc. */
 
-static inline int contains_linear(HsInt needle,
-                                  const HsInt *hay, HsInt n) {
+static inline int contains_linear(HsInt64 needle,
+                                  const HsInt64 *hay, HsInt n) {
     for (HsInt i = 0; i < n; i++)
         if (hay[i] == needle) return 1;
     return 0;
@@ -137,18 +137,18 @@ static inline int contains_linear(HsInt needle,
 /* -------------------------------------------------------------------
  * Dispatch: SIMD linear for small sets, branchless bsearch for large
  * ------------------------------------------------------------------- */
-static inline int contains(HsInt needle, const HsInt *sorted, HsInt n) {
+static inline int contains(HsInt64 needle, const HsInt64 *sorted, HsInt n) {
     return (n <= LINEAR_THRESHOLD)
         ? contains_linear(needle, sorted, n)
         : contains_bsearch(needle, sorted, n);
 }
 
 /* -------------------------------------------------------------------
- * qsort comparator for HsInt. Branchless: (x > y) - (x < y)
+ * qsort comparator for HsInt64. Branchless: (x > y) - (x < y)
  * ------------------------------------------------------------------- */
 static int cmp_hsint(const void *a, const void *b) {
-    HsInt x = *(const HsInt *)a;
-    HsInt y = *(const HsInt *)b;
+    HsInt64 x = *(const HsInt64 *)a;
+    HsInt64 y = *(const HsInt64 *)b;
     return (x > y) - (x < y);
 }
 
@@ -160,8 +160,7 @@ static int cmp_hsint(const void *a, const void *b) {
  *
  * Sorts live[] in place (needed for the binary search fallback when
  * n_live > LINEAR_THRESHOLD), then scans keys[0..cap). A slot is
- * occupied iff its key is non-zero and, with the version bits masked
- * off by tomb_mask, is not the tombstone.
+ * occupied iff its key is neither zero nor the tombstone.
  *
  * Output layout in dead_out (must have room for 2 * cap + 1 elements):
  *   dead_out[0]        = total occupied slots (for shrink decisions)
@@ -178,26 +177,24 @@ static int cmp_hsint(const void *a, const void *b) {
  * (GHC passes payload pointer with UnliftedFFITypes).
  * ------------------------------------------------------------------- */
 HsInt purge_find_dead(
-    const HsInt *keys,
+    const HsInt64 *keys,
     HsInt cap,
-    HsInt *live,
+    HsInt64 *live,
     HsInt n_live,
-    HsInt tombstone_val,
-    HsInt tomb_mask,
-    HsInt key_mask,
-    HsInt *dead_out)
+    HsInt64 tombstone_val,
+    HsInt64 key_mask,
+    HsInt64 *dead_out)
 {
     if (n_live > 1)
-        qsort(live, (size_t)n_live, sizeof(HsInt), cmp_hsint);
+        qsort(live, (size_t)n_live, sizeof(HsInt64), cmp_hsint);
 
     HsInt dead_count = 0;
     HsInt occupied = 0;
     for (HsInt i = 0; i < cap; i++) {
-        HsInt k = keys[i];
-        /* A tombstone keeps its version bits; strip them before comparing. */
-        if (k != 0 && (k & tomb_mask) != tombstone_val) {
+        HsInt64 k = keys[i];
+        if (k != 0 && k != tombstone_val) {
             occupied++;
-            HsInt raw_k = k & key_mask;
+            HsInt64 raw_k = k & key_mask;
             if (!contains(raw_k, live, n_live)) {
                 dead_out[1 + 2 * dead_count] = i;
                 dead_out[2 + 2 * dead_count] = k;
@@ -221,19 +218,19 @@ HsInt purge_find_dead(
  * Returns the remaining count. dead_out[0] is left untouched.
  * ------------------------------------------------------------------- */
 HsInt purge_filter_live(
-    HsInt *dead_out,
+    HsInt64 *dead_out,
     HsInt n_dead,
-    HsInt *live,
+    HsInt64 *live,
     HsInt n_live,
-    HsInt key_mask)
+    HsInt64 key_mask)
 {
     if (n_live > 1)
-        qsort(live, (size_t)n_live, sizeof(HsInt), cmp_hsint);
+        qsort(live, (size_t)n_live, sizeof(HsInt64), cmp_hsint);
 
     HsInt kept = 0;
     for (HsInt i = 0; i < n_dead; i++) {
-        HsInt slot = dead_out[1 + 2 * i];
-        HsInt k    = dead_out[2 + 2 * i];
+        HsInt64 slot = dead_out[1 + 2 * i];
+        HsInt64 k    = dead_out[2 + 2 * i];
         if (!contains(k & key_mask, live, n_live)) {
             dead_out[1 + 2 * kept] = slot;
             dead_out[2 + 2 * kept] = k;

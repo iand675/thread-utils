@@ -11,20 +11,34 @@
   instead of being a failed `unsafeCoerce#`; identity is tested `sameMutVar#`
   via `IORef`'s `Eq` instance now, instead of `reallyUnsafePtrEquality#`.
 - Every write to the value array is now bracketed by a CAS of the key into
-  a transient "claiming" state (bit 33) that's skipped by the probe, so a key
-  can never be observed as corresponding to a different key's value.
+  a transient "claiming" state. A probe for that thread waits for the claim
+  to finish, and a second writer waits rather than claiming over it, so a
+  key is never observed with a value that was not written for it.
   Tombstoning is a CAS from the observed key, then a CAS of the value, so the
   tombstone never ends up in a slot that has since been re-claimed.
-- Every (key, value) pair is read with a per-slot seqlock in CMM (key, value,
-  key again, ordered by acquire loads), and a publication counter in the spare
-  key bits (34..62) makes the check robust to a slot being recycled back to the
-  same thread ID between the two key reads.
+- A tombstoned slot is no longer reused by another thread in place. Inserts
+  stop at three quarters of the slots, tombstones included, and the table is
+  then rehashed (at the same capacity when fewer than half the slots are
+  live). Since a slot's thread ID never changes within a table, probes read
+  the key once (with acquire semantics) and then the value, with no retry
+  loop.
+- Store thread IDs in full. GHC's thread IDs are 64-bit, but keys kept only
+  their low 32 bits, so after 2^32 forks a thread stopped finding its own
+  entry and could be mistaken for a detached entry of the older thread
+  sharing its low bits (often the main thread). Keys are now 64 bits on
+  every target, with the three flag bits at the top and the ID in the low
+  61. 32-bit targets use portable Haskell probes in place of the CMM ones.
+  The public API still passes IDs as `Int`/`Word`, so on 32-bit targets
+  `getThreadId`, `getCurrentThreadId`, the raw and ref APIs, and
+  `storedItems` see only the low 32 bits; the current-thread and
+  `ThreadId`-taking functions use the full ID.
 - `rehashTable` no longer spins on a half-written slot; instead, it skips them
   and runs a second pass after publishing the new table to carry claims over.
 - `purgeDeadThreads` re-checks its candidates against a second `listThreads`
   snapshot taken after the scan, so a thread forked between the first snapshot
   and the scan is no longer treated as dead.
-- Add a purge-contention stress test and pure-C coverage for the purge scan.
+- Add a purge-contention stress test, a regression test for IDs past 2^32,
+  and pure-C coverage for the purge scan.
 
 ## 0.4.1.1
 

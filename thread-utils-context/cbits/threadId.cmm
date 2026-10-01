@@ -3,50 +3,47 @@
 // -----------------------------------------------------------------------
 // Key encoding
 //
-// Thread IDs are StgWord32, occupying the low 32 bits of each key slot.
-// Two flag bits sit above the ID:
+// Each key slot is 64 bits on every target. The top three bits are flags
+// and the low 61 hold the thread ID (StgThreadID, a 64-bit counter).
 //
-//   bit 32, DETACHED: set when the user detaches a context, cleared on
+//   TOMBSTONE (bit 63): the whole word, set when the slot's thread is
+//     gone. A tombstoned slot is never reused within this table; only a
+//     rehash reclaims it (see Storage.hs).
+//
+//   CLAIMING (bit 62): set by a writer between CAS-ing the key and
+//     writing the value slot (see claimAndPublish in Storage.hs). A probe
+//     for a thread whose claim is in flight waits for it to finish. The
+//     window is straight-line code with no safepoint, so it is short.
+//
+//   DETACHED (bit 61): set when the user detaches a context, cleared on
 //     re-attach. The probe masks this bit when comparing against the
 //     target tid and encodes the detached state in the return value so
 //     the Haskell side never touches the value array for detached slots.
-//
-//   bit 33, CLAIMING: set by the owner between CAS-ing the key and
-//     writing the value slot (see claimAndPublish in Storage.hs). A slot
-//     in this state is treated as *not matching* -- the probe keeps
-//     walking -- so a key is never observed paired with a value that
-//     has not been written for it yet.
 //
 // Slot hashing uses a Fibonacci/golden-ratio multiplicative hash
 // to spread sequential thread IDs across cache lines, avoiding false
 // sharing on the key and value arrays.
 //
+// The probes below need a single-instruction 64-bit acquire load, so
+// they exist only on 64-bit targets. 32-bit targets use the portable
+// Haskell probes in Storage.hs and only need stg_getCurrentThreadId.
+//
 // -----------------------------------------------------------------------
 // Reading a (key, value) pair
 //
-// A key and its value are two words written separately, so a reader
-// must snapshot them consistently. Every pair read here is a seqlock:
-//
-//     key   = load_acquire(keys[slot])
-//     ref   = load_acquire(vals[slot])
-//     key2  = load(keys[slot])
-//     retry unless key2 == key
-//
-// The two acquire loads order the three loads (key <= ref <= key2) on
-// weakly ordered hardware without a full fence; on x86 they are plain
-// moves. Since a slot cannot change hands without its key passing
-// through CLAIMING or TOMBSTONE, and every publication bumps the version
-// bits, key2 == key means `ref` was the value published for `key` -- even
-// if the slot was recycled back to the same tid in between.
+// A key and its value are two words written separately. Within one
+// table, a slot's thread ID never changes once claimed: the slot goes
+// 0 -> tid|CLAIMING -> tid <-> tid|DETACHED, and finally to TOMBSTONE. So
+// once a probe has seen `tid`, the value slot holds one of tid's own
+// IORefs or this map's dead-slot placeholder, never another thread's.
+// The key is read with acquire semantics so that the value written
+// before the key was published is visible; on x86 it is a plain move.
 // -----------------------------------------------------------------------
 
-#define HASH_SALT     0x9E3779B97F4A7C15
-#define DETACHED_BIT  0x0000000100000000
-#define CLAIMING_BIT  0x0000000200000000
-#define KEY_MASK      0x00000000FFFFFFFF
-// Bits 34..62 hold a per-slot publication counter; see Storage.hs. The
-// probes compare whole words, so it participates in the seqlock check
-// automatically and closes the same-tid ABA case.
+#define HASH_SALT       0x9E3779B97F4A7C15
+#define CLAIMING_BIT    0x4000000000000000
+#define DETACHED_BIT    0x2000000000000000
+#define KEY_MASK        0x1FFFFFFFFFFFFFFF
 
 #define KEY_ADDR(keys, slot) ((keys) + SIZEOF_StgArrBytes   + WDS(slot))
 #define VAL_ADDR(vals, slot) ((vals) + SIZEOF_StgMutArrPtrs + WDS(slot))
@@ -65,31 +62,28 @@ stg_getCurrentThreadId()
 }
 
 
+#if SIZEOF_W == 8
+
 // -----------------------------------------------------------------------
 // stg_readSlot
 //
-// Consistent (key, value) snapshot of one slot; see the note above.
+// (key, value) read of one slot; see the note above.
 //
 // Arguments:
-//   P_ keys  : MutableByteArray# of Int-sized keys
+//   P_ keys  : MutableByteArray# of 64-bit keys
 //   P_ vals  : MutableArray# of IORef values
 //   W_ slot  : index
 //
-// Returns: (Int# key, P_ ref)
+// Returns: (Int64# key, P_ ref)
 // -----------------------------------------------------------------------
 
 stg_readSlot(P_ keys, P_ vals, W_ slot)
 {
-    W_ key, key2;
+    W_ key;
     P_ ref;
 
-  again:
     (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
-    (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
-    key2 = W_[KEY_ADDR(keys, slot)];
-    if (key2 != key) {
-        goto again;
-    }
+    ref = W_[VAL_ADDR(vals, slot)];
     return (key, ref);
 }
 
@@ -101,14 +95,14 @@ stg_readSlot(P_ keys, P_ vals, W_ slot)
 // read.
 //
 // Arguments:
-//   P_ keys  : MutableByteArray# holding Int-sized keys per slot
+//   P_ keys  : MutableByteArray# holding 64-bit keys per slot
 //   P_ vals  : MutableArray# holding the IORef per slot
 //   W_ mask  : table capacity - 1 (for bitwise AND)
 //
-// Returns: (Int# tid, Int# slot, Int# key, P_ ref)
+// Returns: (Int64# tid, Int# slot, Int64# key, P_ ref)
+//   tid is masked to KEY_MASK, the form in which keys are stored.
 //   slot >= 0   -> entry found and attached at that index; key is the
-//                  full key word observed there and ref its value, read
-//                  consistently with that key
+//                  full key word observed there and ref its value
 //   slot == -1  -> entry not found; key is 0, ref a placeholder (keys)
 //   slot <= -2  -> entry found but detached; real index = -(slot+2);
 //                  key is the observed word (CAS against it to
@@ -117,32 +111,25 @@ stg_readSlot(P_ keys, P_ vals, W_ slot)
 
 stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
 {
-    W_ tid, home, slot, key, key2, raw_key;
+    W_ tid, home, slot, key;
     P_ ref;
 
-    tid  = TO_W_(StgTSO_id(CurrentTSO));
+    tid  = TO_W_(StgTSO_id(CurrentTSO)) & KEY_MASK;
     home = (tid * HASH_SALT) & mask;
     slot = home;
 
   again:
     (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
-    raw_key = key & KEY_MASK;
 
-    if (raw_key == tid) {
+    if ((key & KEY_MASK) == tid) {
         if ((key & CLAIMING_BIT) != 0) {
-            // Owner is mid-write; invisible until published.
-            goto next;
-        }
-        if ((key & DETACHED_BIT) != 0) {
-            // Key matches but detached bit is set.
-            return (tid, 0 - slot - 2, key, keys);
-        }
-        (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
-        key2 = W_[KEY_ADDR(keys, slot)];
-        if (key2 != key) {
-            // Slot changed under us; re-examine it from scratch.
+            // A writer is mid-claim on this thread's slot; wait for it.
             goto again;
         }
+        if ((key & DETACHED_BIT) != 0) {
+            return (tid, 0 - slot - 2, key, keys);
+        }
+        ref = W_[VAL_ADDR(vals, slot)];
         return (tid, slot, key, ref);
     }
 
@@ -150,7 +137,6 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
         return (tid, -1, 0, keys);
     }
 
-  next:
     slot = (slot + 1) & mask;
     if (slot != home) {
         goto again;
@@ -167,17 +153,17 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
 // Used by lookupRaw / updateRaw / adjustOnThread.
 //
 // Arguments:
-//   P_ keys  : MutableByteArray# holding Int-sized keys per slot
+//   P_ keys  : MutableByteArray# holding 64-bit keys per slot
 //   P_ vals  : MutableArray# holding the IORef per slot
 //   W_ mask  : table capacity - 1
-//   W_ tid   : the raw key to search for (lower 32 bits only)
+//   W_ tid   : the thread ID to search for, already masked to KEY_MASK
 //
-// Returns: (Int# slot, Int# key, P_ ref)  (same encoding as stg_probeThreadSlot)
+// Returns: (Int# slot, Int64# key, P_ ref)  (same encoding as stg_probeThreadSlot)
 // -----------------------------------------------------------------------
 
 stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
 {
-    W_ home, slot, key, key2, raw_key;
+    W_ home, slot, key;
     P_ ref;
 
     home = (tid * HASH_SALT) & mask;
@@ -185,20 +171,15 @@ stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
 
   again:
     (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
-    raw_key = key & KEY_MASK;
 
-    if (raw_key == tid) {
+    if ((key & KEY_MASK) == tid) {
         if ((key & CLAIMING_BIT) != 0) {
-            goto next;
+            goto again;
         }
         if ((key & DETACHED_BIT) != 0) {
             return (0 - slot - 2, key, keys);
         }
-        (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
-        key2 = W_[KEY_ADDR(keys, slot)];
-        if (key2 != key) {
-            goto again;
-        }
+        ref = W_[VAL_ADDR(vals, slot)];
         return (slot, key, ref);
     }
 
@@ -206,7 +187,6 @@ stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
         return (-1, 0, keys);
     }
 
-  next:
     slot = (slot + 1) & mask;
     if (slot != home) {
         goto again;
@@ -214,3 +194,5 @@ stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
 
     return (-1, 0, keys);
 }
+
+#endif
