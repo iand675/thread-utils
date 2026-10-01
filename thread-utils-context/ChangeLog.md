@@ -15,9 +15,11 @@
   can never be observed as corresponding to a different key's value.
   Tombstoning is a CAS from the observed key, then a CAS of the value, so the
   tombstone never ends up in a slot that has since been re-claimed.
+- Every (key, value) pair is read with a per-slot seqlock in CMM (key, value,
+  key again, ordered by acquire loads).
 - `rehashTable` no longer spins on a half-written slot; instead, it skips them
   and runs a second pass after publishing the new table to carry claims over.
-- Add pure-C coverage for the purge scan.
+- Add a purge-contention stress test and pure-C coverage for the purge scan.
 
 ## 0.4.1.1
 

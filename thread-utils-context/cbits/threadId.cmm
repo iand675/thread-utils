@@ -20,12 +20,33 @@
 // Slot hashing uses a Fibonacci/golden-ratio multiplicative hash
 // to spread sequential thread IDs across cache lines, avoiding false
 // sharing on the key and value arrays.
+//
+// -----------------------------------------------------------------------
+// Reading a (key, value) pair
+//
+// A key and its value are two words written separately, so a reader
+// must snapshot them consistently. Every pair read here is a seqlock:
+//
+//     key   = load_acquire(keys[slot])
+//     ref   = load_acquire(vals[slot])
+//     key2  = load(keys[slot])
+//     retry unless key2 == key
+//
+// The two acquire loads order the three loads (key <= ref <= key2) on
+// weakly ordered hardware without a full fence; on x86 they are plain
+// moves. Since a slot cannot change hands without its key passing
+// through CLAIMING or TOMBSTONE, key2 == key means `ref` was the value
+// published for `key` (barring the theoretical two-republish ABA within
+// one read, which a version counter in the spare key bits would close).
 // -----------------------------------------------------------------------
 
 #define HASH_SALT     0x9E3779B97F4A7C15
 #define DETACHED_BIT  0x0000000100000000
 #define CLAIMING_BIT  0x0000000200000000
 #define KEY_MASK      0x00000000FFFFFFFF
+
+#define KEY_ADDR(keys, slot) ((keys) + SIZEOF_StgArrBytes   + WDS(slot))
+#define VAL_ADDR(vals, slot) ((vals) + SIZEOF_StgMutArrPtrs + WDS(slot))
 
 // -----------------------------------------------------------------------
 // stg_getCurrentThreadId
@@ -42,31 +63,64 @@ stg_getCurrentThreadId()
 
 
 // -----------------------------------------------------------------------
+// stg_readSlot
+//
+// Consistent (key, value) snapshot of one slot; see the note above.
+//
+// Arguments:
+//   P_ keys  : MutableByteArray# of Int-sized keys
+//   P_ vals  : MutableArray# of IORef values
+//   W_ slot  : index
+//
+// Returns: (Int# key, P_ ref)
+// -----------------------------------------------------------------------
+
+stg_readSlot(P_ keys, P_ vals, W_ slot)
+{
+    W_ key, key2;
+    P_ ref;
+
+  again:
+    (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
+    (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
+    key2 = W_[KEY_ADDR(keys, slot)];
+    if (key2 != key) {
+        goto again;
+    }
+    return (key, ref);
+}
+
+
+// -----------------------------------------------------------------------
 // stg_probeThreadSlot
 //
-// Fused thread ID retrieval + multiplicative-hash linear probe.
+// Fused thread ID retrieval + multiplicative-hash linear probe + value
+// read.
 //
 // Arguments:
 //   P_ keys  : MutableByteArray# holding Int-sized keys per slot
+//   P_ vals  : MutableArray# holding the IORef per slot
 //   W_ mask  : table capacity - 1 (for bitwise AND)
 //
-// Returns: (Int# tid, Int# slot)
-//   slot >= 0   -> entry found and attached at that index
-//   slot == -1  -> entry not found
-//   slot <= -2  -> entry found but detached; real index = -(slot+2)
+// Returns: (Int# tid, Int# slot, P_ ref)
+//   slot >= 0   -> entry found and attached at that index; ref is its
+//                  value, read consistently with the key
+//   slot == -1  -> entry not found; ref is a placeholder (keys)
+//   slot <= -2  -> entry found but detached; real index = -(slot+2);
+//                  ref is a placeholder (keys)
 // -----------------------------------------------------------------------
 
-stg_probeThreadSlot(P_ keys, W_ mask)
+stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
 {
-    W_ tid, home, slot, key, base, raw_key;
+    W_ tid, home, slot, key, key2, raw_key;
+    P_ ref;
 
     tid  = TO_W_(StgTSO_id(CurrentTSO));
     home = (tid * HASH_SALT) & mask;
     slot = home;
-    base = keys + SIZEOF_StgArrBytes;
 
   again:
-    key = W_[base + WDS(slot)];
+    (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
     raw_key = key & KEY_MASK;
 
     if (raw_key == tid) {
@@ -76,13 +130,19 @@ stg_probeThreadSlot(P_ keys, W_ mask)
         }
         if (key != tid) {
             // Key matches but detached bit is set.
-            return (tid, 0 - slot - 2);
+            return (tid, 0 - slot - 2, keys);
         }
-        return (tid, slot);
+        (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
+        key2 = W_[KEY_ADDR(keys, slot)];
+        if (key2 != key) {
+            // Slot changed under us; re-examine it from scratch.
+            goto again;
+        }
+        return (tid, slot, ref);
     }
 
     if (key == 0) {
-        return (tid, -1);
+        return (tid, -1, keys);
     }
 
   next:
@@ -91,34 +151,35 @@ stg_probeThreadSlot(P_ keys, W_ mask)
         goto again;
     }
 
-    return (tid, -1);
+    return (tid, -1, keys);
 }
 
 
 // -----------------------------------------------------------------------
 // stg_probeSlotByKey
 //
-// Linear probe with an explicit key (not CurrentTSO).
+// Linear probe with an explicit key (not CurrentTSO), plus value read.
 // Used by lookupRaw / updateRaw / adjustOnThread.
 //
 // Arguments:
 //   P_ keys  : MutableByteArray# holding Int-sized keys per slot
+//   P_ vals  : MutableArray# holding the IORef per slot
 //   W_ mask  : table capacity - 1
 //   W_ tid   : the raw key to search for (lower 32 bits only)
 //
-// Returns: Int# slot  (same encoding as stg_probeThreadSlot)
+// Returns: (Int# slot, P_ ref)  (same encoding as stg_probeThreadSlot)
 // -----------------------------------------------------------------------
 
-stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
+stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
 {
-    W_ home, slot, key, base, raw_key;
+    W_ home, slot, key, key2, raw_key;
+    P_ ref;
 
     home = (tid * HASH_SALT) & mask;
     slot = home;
-    base = keys + SIZEOF_StgArrBytes;
 
   again:
-    key = W_[base + WDS(slot)];
+    (key) = prim %load_acquire64(KEY_ADDR(keys, slot));
     raw_key = key & KEY_MASK;
 
     if (raw_key == tid) {
@@ -126,13 +187,18 @@ stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
             goto next;
         }
         if (key != tid) {
-            return (0 - slot - 2);
+            return (0 - slot - 2, keys);
         }
-        return (slot);
+        (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
+        key2 = W_[KEY_ADDR(keys, slot)];
+        if (key2 != key) {
+            goto again;
+        }
+        return (slot, ref);
     }
 
     if (key == 0) {
-        return (-1);
+        return (-1, keys);
     }
 
   next:
@@ -141,5 +207,5 @@ stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
         goto again;
     }
 
-    return (-1);
+    return (-1, keys);
 }

@@ -1,14 +1,17 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 import System.Mem
 import Control.Concurrent
 import Control.Concurrent.MVar
 import Control.Concurrent.Thread.Storage
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad
 import Data.IORef
 import Data.List hiding (lookup)
 import GHC.Stats (getRTSStatsEnabled, getRTSStats, gc, gcdetails_live_bytes)
+import System.Timeout (timeout)
 import Test.Hspec
 import Prelude hiding (lookup)
 
@@ -291,6 +294,72 @@ main = hspec $ do
 
       length survivors `shouldBe` nReal
       all (\(k, _) -> fromIntegral k < synthBase) survivors `shouldBe` True
+
+    -- A key and its value are two separately written words. This hammers
+    -- the window between them: synthetic keys never appear in listThreads,
+    -- so a purge loop tombstones every one of them continuously while a
+    -- mutator per key keeps re-inserting and a reader per key keeps
+    -- observing. Any read that yields another key's value, or that forces
+    -- the dead-slot placeholder, is a bug.
+    --
+    -- Failure modes this has caught: dereferencing the shared sentinel as
+    -- an IORef of the wrong type (garbage Ints), a live IORef left under a
+    -- tombstone and later paired with a colliding key (another key's
+    -- value), and a resize spinning forever on a half-tombstoned slot
+    -- while holding the resize lock (hence the hard timeout).
+    it "never exposes another key's value or a dead slot under purge contention" $ do
+      let nKeys = 32 :: Int
+          iters = 20_000 :: Int
+          synthBase = 0x40000000 :: Word
+      tsm <- newThreadStorageMapWith 16
+      mainTid <- myThreadId
+      bad <- newIORef (0 :: Int)
+      exc <- newIORef (0 :: Int)
+      stop <- newIORef False
+      done <- newEmptyMVar
+      let check :: Int -> Maybe Int -> IO ()
+          check expected mv = case mv of
+            Nothing -> pure ()
+            Just v -> do
+              r <- try (evaluate (v == expected))
+              case r of
+                Left (_ :: SomeException) -> atomicModifyIORef' exc (\x -> (x + 1, ()))
+                Right True -> pure ()
+                Right False -> atomicModifyIORef' bad (\x -> (x + 1, ()))
+      _ <- forkIO $ do
+        let loop = do
+              s <- readIORef stop
+              unless s $ purgeDeadThreads tsm >> yield >> loop
+        loop
+        putMVar done ()
+      forM_ [0 .. nKeys - 1] $ \i -> do
+        let k = synthBase + fromIntegral i
+            kInt = fromIntegral k :: Int
+        _ <- forkIO $ do
+          replicateM_ iters $ do
+            _ <- updateRaw tsm mainTid k (\_ -> (Just i, ()))
+            lookupRaw tsm k >>= check i
+            ref <- ensureRef tsm mainTid kInt i
+            readIORef ref >>= check i . Just
+          putMVar done ()
+        _ <- forkIO $ do
+          let loop = do
+                s <- readIORef stop
+                unless s $ do
+                  lookupRaw tsm k >>= check i
+                  mref <- lookupRef tsm kInt
+                  forM_ mref $ \r -> readIORef r >>= check i . Just
+                  loop
+          loop
+          putMVar done ()
+        pure ()
+      finished <- timeout 60_000_000 $ do
+        replicateM_ nKeys (takeMVar done) -- mutators
+        writeIORef stop True
+        replicateM_ (nKeys + 1) (takeMVar done) -- readers + purger
+      finished `shouldBe` Just ()
+      readIORef bad >>= (`shouldBe` 0)
+      readIORef exc >>= (`shouldBe` 0)
 
     -- Regression test for a laundered TSO pointer in getThreadIdInt.
     --
