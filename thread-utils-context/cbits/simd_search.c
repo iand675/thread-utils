@@ -208,3 +208,37 @@ HsInt purge_find_dead(
     dead_out[0] = occupied;
     return dead_count;
 }
+
+/* -------------------------------------------------------------------
+ * purge_filter_live
+ *
+ * Second-snapshot filter for purgeDeadThreads. Takes the dead_out array
+ * produced by purge_find_dead and a live set taken *after* the scan, and
+ * compacts dead_out in place to only those entries whose key is still
+ * absent from the live set. Threads forked between the first snapshot
+ * and the scan are thereby rescued. Sorts live[] in place.
+ *
+ * Returns the remaining count. dead_out[0] is left untouched.
+ * ------------------------------------------------------------------- */
+HsInt purge_filter_live(
+    HsInt *dead_out,
+    HsInt n_dead,
+    HsInt *live,
+    HsInt n_live,
+    HsInt key_mask)
+{
+    if (n_live > 1)
+        qsort(live, (size_t)n_live, sizeof(HsInt), cmp_hsint);
+
+    HsInt kept = 0;
+    for (HsInt i = 0; i < n_dead; i++) {
+        HsInt slot = dead_out[1 + 2 * i];
+        HsInt k    = dead_out[2 + 2 * i];
+        if (!contains(k & key_mask, live, n_live)) {
+            dead_out[1 + 2 * kept] = slot;
+            dead_out[2 + 2 * kept] = k;
+            kept++;
+        }
+    }
+    return kept;
+}

@@ -89,9 +89,9 @@ static const HsInt SIZES[] = {
 };
 
 /* -------------------------------------------------------------------
- * purge_find_dead: exercise the dead_out layout, empty/tombstone
- * skipping, and flag-bit masking (version bits included). Mirrors the
- * constants in Storage.hs.
+ * purge_find_dead / purge_filter_live: exercise the dead_out layout,
+ * empty/tombstone skipping, flag-bit masking, and the second-snapshot
+ * rescue. Mirrors the constants in Storage.hs.
  * ------------------------------------------------------------------- */
 #define TOMBSTONE     ((HsInt)1 << 63)
 #define DETACHED_BIT  ((HsInt)1 << 32)
@@ -110,7 +110,7 @@ static void check_purge_scan(void) {
     keys[4]  = 21 | DETACHED_BIT;         /* dead, detached              */
     keys[5]  = TOMBSTONE | VERSION(7);    /* skipped despite its version */
     keys[6]  = 22 | CLAIMING_BIT;         /* dead, mid-claim (reported)  */
-    keys[7]  = 30 | VERSION(1);           /* dead                        */
+    keys[7]  = 30 | VERSION(1);           /* born after snapshot 1       */
     keys[8]  = TOMBSTONE;                 /* skipped                     */
     keys[9]  = 12;                        /* live                        */
 
@@ -135,9 +135,26 @@ static void check_purge_scan(void) {
               (long long)i, (unsigned long long)dead_out[2 + 2 * i], (unsigned long long)exp_keys[i]);
     }
 
+    /* Second snapshot: 30 has appeared. It must be rescued; the rest stay. */
+    HsInt live2[] = { 30, 12, 11, 10 };
+    HsInt kept = purge_filter_live(dead_out, n, live2, 4, KEY_MASK);
+    CHECK(kept == 3, "purge_filter_live: kept = %lld, expected 3", (long long)kept);
+    CHECK(dead_out[0] == 7, "purge_filter_live: clobbered dead_out[0]");
+    const HsInt exp_slots2[] = { 3, 4, 6 };
+    for (HsInt i = 0; i < kept && i < 3; i++) {
+        CHECK(dead_out[1 + 2 * i] == exp_slots2[i],
+              "purge_filter_live: entry %lld slot = %lld, expected %lld",
+              (long long)i, (long long)dead_out[1 + 2 * i], (long long)exp_slots2[i]);
+        CHECK(dead_out[2 + 2 * i] == exp_keys[i],
+              "purge_filter_live: entry %lld key changed", (long long)i);
+    }
+
     /* Empty live set: everything occupied is dead. */
     HsInt n0 = purge_find_dead(keys, CAP, live1, 0, TOMBSTONE, TOMB_MASK, KEY_MASK, dead_out);
-    CHECK(n0 == 7, "purge_find_dead(n_live=0): count = %lld, expected 7", (long long)n0);}
+    CHECK(n0 == 7, "purge_find_dead(n_live=0): count = %lld, expected 7", (long long)n0);
+    HsInt kept0 = purge_filter_live(dead_out, n0, live1, 0, KEY_MASK);
+    CHECK(kept0 == 7, "purge_filter_live(n_live=0): kept = %lld, expected 7", (long long)kept0);
+}
 
 int main(void) {
     static HsInt buf[8 * LINEAR_THRESHOLD];

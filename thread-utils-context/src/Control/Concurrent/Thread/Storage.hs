@@ -1382,6 +1382,19 @@ foreign import ccall unsafe "purge_find_dead"
     -> IO Int                                 -- count of dead slots
 
 
+-- | Drop from a 'c_purge_find_dead' result every entry whose key is in a
+-- second live set (sorted in place), compacting the array. Returns the
+-- remaining count.
+foreign import ccall unsafe "purge_filter_live"
+  c_purge_filter_live
+    :: Exts.MutableByteArray# Exts.RealWorld  -- dead_out (in/out)
+    -> Int                                    -- n_dead
+    -> Exts.MutableByteArray# Exts.RealWorld  -- live set (sorted in place)
+    -> Int                                    -- n_live
+    -> Int                                    -- key_mask
+    -> IO Int                                 -- remaining count
+
+
 -- | Tombstone slots belonging to threads that are no longer alive,
 -- and shrink the table if the load factor drops below 25%.
 --
@@ -1397,9 +1410,13 @@ foreign import ccall unsafe "purge_find_dead"
 -- binary search (Khuong / Lemire CMOV style) for large ones.  A single
 -- @unsafe ccall@ amortises FFI overhead across the full table scan.
 --
--- Tombstoning (key + value slot) is done on the Haskell side, by CAS from
--- the key observed during the scan, so a slot that has since been
--- re-claimed is never touched; this also maintains GC write barriers.
+-- A thread forked /after/ the thread list was taken but /before/ the scan
+-- would otherwise look dead, so the candidates are re-checked against a
+-- second 'listThreads' snapshot taken after the scan: a thread that
+-- attached inside that window and is still running is kept. Tombstoning
+-- (key + value slot) is then done on the Haskell side, by CAS from the key
+-- observed during the scan, so a slot that has since been re-claimed is
+-- never touched; this also maintains GC write barriers.
 --
 -- After tombstoning, if the number of remaining live entries is less
 -- than 1\/4 of the table capacity (and the capacity exceeds the 16-slot
@@ -1418,7 +1435,14 @@ purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
   tids <- listThreads
   (MutIntArray liveArr#, nLive) <- buildLiveSet tids
   deadArr@(MutIntArray deadArr#) <- newMutIntArray (2 * cap + 1)
-  deadCount <- c_purge_find_dead keys# cap liveArr# nLive tombstoneBit (Data.Bits.complement versionMask) keyMask deadArr#
+  candidates <- c_purge_find_dead keys# cap liveArr# nLive tombstoneBit (Data.Bits.complement versionMask) keyMask deadArr#
+  deadCount <-
+    if candidates == 0
+      then pure 0
+      else do
+        tids2 <- listThreads
+        (MutIntArray live2#, nLive2) <- buildLiveSet tids2
+        c_purge_filter_live deadArr# candidates live2# nLive2 keyMask
   let tomb !i
         | i > deadCount = pure ()
         | otherwise = do
