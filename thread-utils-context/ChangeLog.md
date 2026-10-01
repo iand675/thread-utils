@@ -1,5 +1,9 @@
 # Changelog for thread-utils-context
 
+## 0.4.2.0
+
+- Add pure-C coverage for the purge scan.
+
 ## 0.4.1.1
 
 - Fix `purgeDeadThreads` retaining finished threads and evicting live ones.

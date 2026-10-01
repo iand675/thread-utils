@@ -267,6 +267,31 @@ main = hspec $ do
       putMVar gate ()
       length survivors `shouldBe` n
 
+    it "purges phantom entries with no matching live thread, and only those" $ do
+      let nReal = 200
+          nSynthetic = 200
+          synthBase = 0x40000000 :: Word
+      gate <- newEmptyMVar
+      tsm <- newThreadStorageMapWith 16
+      mainTid <- myThreadId
+
+      forM_ [0 .. nSynthetic - 1] $ \i ->
+        updateRaw tsm mainTid (synthBase + fromIntegral i) (\_ -> (Just (i :: Int), ()))
+
+      replicateM_ nReal $ forkIO $ do
+        attach tsm (0 :: Int)
+        readMVar gate
+
+      waitForCount tsm (nReal + nSynthetic)
+
+      purgeDeadThreads tsm
+
+      survivors <- storedItems tsm
+      putMVar gate ()
+
+      length survivors `shouldBe` nReal
+      all (\(k, _) -> fromIntegral k < synthBase) survivors `shouldBe` True
+
     -- Regression test for a laundered TSO pointer in getThreadIdInt.
     --
     -- purgeDeadThreads calls listThreads and converts every ThreadId in the

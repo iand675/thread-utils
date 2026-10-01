@@ -1,7 +1,7 @@
 cabal-version: 3.0
 
 name:           thread-utils-context
-version:        0.4.1.1
+version:        0.4.2.0
 synopsis:       Garbage-collected thread local storage
 description:    Please see the README on GitHub at <https://github.com/iand675/thread-utils-context#readme>
 category:       Concurrency
