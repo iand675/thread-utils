@@ -6,39 +6,58 @@
   being tombstoned could dereference the shared empty-slot sentinel
   as an `IORef a`, yielding garbage values or writing the given value into the
   sentinel reference shared by every map in the running process.
-- The dead-slot placeholder is now allocated upon construction of the map as an
-  error call of the map's element type, so unsafe access is well-typed (panics)
-  instead of being a failed `unsafeCoerce#`; identity is tested `sameMutVar#`
-  via `IORef`'s `Eq` instance now, instead of `reallyUnsafePtrEquality#`.
-- Every write to the value array is now bracketed by a CAS of the key into
-  a transient "claiming" state. A probe for that thread waits for the claim
-  to finish, and a second writer waits rather than claiming over it, so a
-  key is never observed with a value that was not written for it.
-  Tombstoning is a CAS from the observed key, then a CAS of the value, so the
-  tombstone never ends up in a slot that has since been re-claimed.
+- Values no longer depend on finalizers. Each slot holds a weak pointer
+  keyed on the owning thread whose value is the entry's `MutVar#`, so the
+  GC that finds a thread gone releases its value directly. The per-thread
+  `Weak#` finalizer closure, its run on every thread death, and the
+  dependency on `thread-utils-finalizers` are gone, as is the map being
+  kept alive by every finalizer that referred to it; a map's finalizer
+  now releases the values it holds for threads that outlive it. A map's
+  overhead per parked thread drops from about 146 to about 90 bytes.
+- Every change to a slot's value cell or attached state is bracketed by a
+  CAS of the key into a transient "claiming" state. A slot is only claimed
+  from a state with no attached value, so a probe that meets a claim reads
+  it as a miss and never waits; a second writer waits (with a yield)
+  rather than claiming over it. Tombstoning is a CAS from the observed key,
+  then a CAS of the cell, so a tombstone never lands on a slot that has
+  since changed.
 - A tombstoned slot is no longer reused by another thread in place. Inserts
   stop at three quarters of the slots, tombstones included, and the table is
   then rehashed (at the same capacity when fewer than half the slots are
   live). Since a slot's thread ID never changes within a table, probes read
-  the key once (with acquire semantics) and then the value, with no retry
+  the key once (with acquire semantics) and then the cell, with no retry
   loop.
+- Rehash freezes every slot of the old table before copying it (a fourth
+  flag bit that no writer will CAS from), and writers that meet a frozen
+  slot wait for the new table. This replaces the copy's second pass and
+  the propagation of detach and re-attach to a newer table, which could
+  lose a write made during a rehash or bring back an entry removed after
+  one. Rehashes also drop dead threads' slots.
 - Store thread IDs in full. GHC's thread IDs are 64-bit, but keys kept only
   their low 32 bits, so after 2^32 forks a thread stopped finding its own
   entry and could be mistaken for a detached entry of the older thread
   sharing its low bits (often the main thread). Keys are now 64 bits on
-  every target, with the three flag bits at the top and the ID in the low
-  61. 32-bit targets use portable Haskell probes in place of the CMM ones.
+  every target, with the four flag bits at the top and the ID in the low
+  60. 32-bit targets use portable Haskell probes in place of the CMM ones.
   The public API still passes IDs as `Int`/`Word`, so on 32-bit targets
   `getThreadId`, `getCurrentThreadId`, the raw and ref APIs, and
   `storedItems` see only the low 32 bits; the current-thread and
   `ThreadId`-taking functions use the full ID.
-- `rehashTable` no longer spins on a half-written slot; instead, it skips them
-  and runs a second pass after publishing the new table to carry claims over.
-- `purgeDeadThreads` re-checks its candidates against a second `listThreads`
-  snapshot taken after the scan, so a thread forked between the first snapshot
-  and the scan is no longer treated as dead.
-- Add a purge-contention stress test, a regression test for IDs past 2^32,
-  and pure-C coverage for the purge scan.
+- An entry keeps one `IORef` for its thread's whole life in the map:
+  `detach` leaves it in place and a later `attach` or `ensureRefFast`
+  writes into it, where it used to allocate a new one.
+- `purgeDeadThreads` checks each entry against its own thread, read
+  through the entry's cell, instead of a `listThreads` snapshot. It no
+  longer evicts live threads under the non-moving collector (whose heap
+  `listThreads` misses), and the C SIMD membership scan it needed is
+  removed. An entry written through `updateRaw` under a key that is not
+  the given thread's ID belongs to no thread and is purged.
+- `lookupRef` and `ensureRef` use the CMM probe.
+- Require GHC 9.6 (`base >= 4.18`), which the CMM's ordered loads already
+  did.
+- Add regression tests for lost writes during rehash, IDs past 2^32,
+  values released at GC for finished threads and dropped maps, the stable
+  per-entry `IORef`, and purge contention.
 
 ## 0.4.1.1
 
