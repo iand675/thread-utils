@@ -58,9 +58,14 @@
 --   value array is bracketed by a CAS of the key into the claiming state
 --   and a release-store of the final key. Probes skip claiming keys.
 --
+-- * Bits 34..62, /version/: a per-slot publication counter, incremented on
+--   every publish and preserved across detach, claiming and tombstoning.
+--
 -- Every (key, value) pair the library reads is snapshotted with a per-slot
 -- seqlock in CMM (key, value, key again -- all ordered by acquire loads),
 -- so a reader never pairs a key with a value that was not published for it.
+-- Because the version is part of the compared word, this holds even if the
+-- slot is recycled back to the same thread ID between the two key reads.
 --
 -- Tombstoning (by a thread's GC finalizer, or by 'purgeDeadThreads') is a
 -- CAS of the key from the value that was observed to the tombstone, and
@@ -167,6 +172,7 @@ import Control.Concurrent.Thread.Finalizers (addThreadFinalizer)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Bits (countLeadingZeros, finiteBitSize, unsafeShiftL, (.&.), (.|.))
+import qualified Data.Bits
 import Data.IORef
 import Foreign.C.Types (CULLong (..))
 import Foreign.Storable (sizeOf)
@@ -200,16 +206,17 @@ foreign import prim "stg_readSlot"
     -> (# Exts.State# Exts.RealWorld, Int#, Any #)
 
 
--- | Probe for the current thread. Returns @(tid, slot, ref)@; @ref@ is only
--- meaningful when @slot >= 0@ (attached), and is then the value read
--- consistently with the matching key.
+-- | Probe for the current thread. Returns @(tid, slot, key, ref)@: @key@
+-- is the full key word observed at the matching slot (callers CAS against
+-- it), and @ref@ is only meaningful when @slot >= 0@ (attached), being the
+-- value read consistently with that key.
 foreign import prim "stg_probeThreadSlot"
   stg_probeThreadSlot#
     :: Exts.MutableByteArray# Exts.RealWorld
     -> Exts.MutableArray# Exts.RealWorld (IORef a)
     -> Int#
     -> Exts.State# Exts.RealWorld
-    -> (# Exts.State# Exts.RealWorld, Int#, Int#, Any #)
+    -> (# Exts.State# Exts.RealWorld, Int#, Int#, Int#, Any #)
 
 
 -- | Probe for an explicit key. Same return encoding as above, minus the tid.
@@ -220,7 +227,7 @@ foreign import prim "stg_probeSlotByKey"
     -> Int#
     -> Int#
     -> Exts.State# Exts.RealWorld
-    -> (# Exts.State# Exts.RealWorld, Int#, Any #)
+    -> (# Exts.State# Exts.RealWorld, Int#, Int#, Any #)
 
 
 -- | The probes return the value slot as 'Any' because 'foreign import prim'
@@ -291,8 +298,11 @@ getThreadIdInt (ThreadId tid#) = fromIntegral (c_getThreadId tid#)
 emptySlot :: Int
 emptySlot = 0
 
-tombstone :: Int
-tombstone = minBound
+
+-- | Bit 63 marks a tombstoned slot; the tid and flag bits are zero but the
+-- version bits are preserved. Test with 'isTombstone', never with @==@.
+tombstoneBit :: Int
+tombstoneBit = minBound
 
 
 -- | Bit 32, set in a key slot to mark "detached by user".  Thread IDs
@@ -311,6 +321,37 @@ claimingBit = 1 `unsafeShiftL` 33
 -- | Mask to extract the raw thread ID from a key (strips the flag bits).
 keyMask :: Int
 keyMask = detachedBit - 1
+
+
+-- | The tid plus both flag bits: everything that describes a slot's state
+-- as opposed to its history.
+stateMask :: Int
+stateMask = keyMask .|. detachedBit .|. claimingBit
+
+
+-- | Bits 34..62: a per-slot publication counter. Every 'claimAndPublish'
+-- increments it, and tombstoning and claiming preserve it, so a slot's
+-- version is monotone over its whole life. The seqlock in the CMM probes
+-- compares whole key words; two equal reads therefore mean no publication
+-- happened in between -- even if the slot was recycled through the same
+-- tid (the ABA case) -- short of 2^29 publications inside one read.
+versionMask :: Int
+versionMask = maxBound .&. Data.Bits.complement (versionUnit - 1)
+
+versionUnit :: Int
+versionUnit = 1 `unsafeShiftL` 34
+
+
+-- | Is this key word a tombstone (of any version)?
+isTombstone :: Int -> Bool
+isTombstone k = k .&. Data.Bits.complement versionMask == tombstoneBit
+{-# INLINE isTombstone #-}
+
+
+-- | The tombstone word that preserves @observed@'s version.
+tombstoneWord :: Int -> Int
+tombstoneWord observed = tombstoneBit .|. (observed .&. versionMask)
+{-# INLINE tombstoneWord #-}
 
 
 -- | Fibonacci / golden-ratio multiplicative hash salt.
@@ -463,16 +504,21 @@ probeFind keys# vals# cap home key = go home 0
 -- written and the caller re-reads. While the claiming bit is set no probe
 -- matches the slot, so readers see either the previous state or the fully
 -- published new pair -- never a key with someone else's value under it.
--- The final 'writeKey' is an @atomicWriteIntArray#@ release-store.
+-- The final 'writeKey' is an @atomicWriteIntArray#@ release-store, and it
+-- carries @observed@'s version plus one; only the tid and detached bits of
+-- @key@ are used.
 claimAndPublish
   :: Exts.MutableByteArray# Exts.RealWorld
   -> Exts.MutableArray# Exts.RealWorld (IORef a)
   -> Int -> Int -> Int -> IORef a -> IO Bool
 claimAndPublish keys# vals# slot observed key ref = do
-  ok <- casKey keys# slot observed (key .|. claimingBit)
+  let !version = observed .&. versionMask
+      !state = key .&. (keyMask .|. detachedBit)
+      !published = ((version + versionUnit) .&. versionMask) .|. state
+  ok <- casKey keys# slot observed (version .|. state .|. claimingBit)
   when ok $ do
     writeVal vals# slot ref
-    writeKey keys# slot key
+    writeKey keys# slot published
   pure ok
 {-# INLINE claimAndPublish #-}
 
@@ -548,7 +594,7 @@ lookup (ThreadStorageMap tableRef _) = liftIO $ do
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# vals# mask# s0 of
-      (# s1, _tid#, slot#, any #)
+      (# s1, _tid#, slot#, _key#, any #)
         | isTrue# (slot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then (# s1, Nothing #)
@@ -623,7 +669,7 @@ update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
   IO $ \s0 ->
     let !(I# mask#) = cap - 1
     in case stg_probeThreadSlot# keys# vals# mask# s0 of
-      (# s1, tid#, rawSlot#, any #)
+      (# s1, tid#, rawSlot#, key#, any #)
         | isTrue# (rawSlot# >=# 0#), ref <- asRef any ->
             -- Hot path: attached. A dead placeholder under a live key
             -- cannot happen under the claiming protocol; treated as a
@@ -637,7 +683,7 @@ update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
                       case writeIORef ref new of { IO writeIt -> case writeIt s2 of
                         { (# s3, _ #) -> (# s3, b #) }}
                     (Nothing, !b) ->
-                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) (I# tid#) of
+                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) (I# key#) (I# tid#) of
                         { IO t -> case t s2 of { (# s3, _ #) -> (# s3, b #) }}
                   }}
         | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> miss s1
@@ -647,7 +693,7 @@ update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
               (Nothing, !b) -> (# s1, b #)
               (Just !new, !b) ->
                 let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) (I# tid#) myThreadId new of
+                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) (I# key#) (I# tid#) myThreadId new of
                   { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
         where
           -- Not found: insert fresh if the callback produces a value.
@@ -660,17 +706,18 @@ update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
 
 
 -- Cold path: mark a slot as detached by setting the detached bit in the
--- key. Writes only to the key array (MutableByteArray#, no GC write
--- barrier) -- the value slot is left untouched. A CAS rather than a blind
--- store so that a tombstone which landed in the meantime is not undone.
+-- key word we observed. Writes only to the key array (MutableByteArray#,
+-- no GC write barrier) -- the value slot is left untouched. A CAS rather
+-- than a blind store so that a tombstone which landed in the meantime is
+-- not undone.
 updateDetach
   :: ThreadStorageMap a
   -> IORef (Table a)
   -> Int
   -> Exts.MutableByteArray# Exts.RealWorld
-  -> Int -> Int -> IO ()
-updateDetach tsm tableRef cap keys# slot tidKey = do
-  _ <- casKey keys# slot tidKey (tidKey .|. detachedBit)
+  -> Int -> Int -> Int -> IO ()
+updateDetach tsm tableRef cap keys# slot observed tidKey = do
+  _ <- casKey keys# slot observed (observed .|. detachedBit)
   Table cap' _ _ _ <- readIORef tableRef
   when (cap' /= cap) $ propagateDetach tsm tidKey
 {-# NOINLINE updateDetach #-}
@@ -689,10 +736,10 @@ reattachSlot
   -> Int
   -> Exts.MutableByteArray# Exts.RealWorld
   -> Exts.MutableArray# Exts.RealWorld (IORef a)
-  -> Int -> Int -> IO ThreadId -> a -> IO ()
-reattachSlot tsm tableRef origCap keys# vals# slot tidKey getTid new = do
+  -> Int -> Int -> Int -> IO ThreadId -> a -> IO ()
+reattachSlot tsm tableRef origCap keys# vals# slot observed tidKey getTid new = do
   newRef <- newIORef new
-  ok <- claimAndPublish keys# vals# slot (tidKey .|. detachedBit) tidKey newRef
+  ok <- claimAndPublish keys# vals# slot observed tidKey newRef
   if ok
     then do
       Table cap' _ _ _ <- readIORef tableRef
@@ -771,7 +818,7 @@ adjust (ThreadStorageMap tableRef _) f = liftIO $ do
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# vals# mask# s0 of
-      (# s1, _tid#, slot#, any #)
+      (# s1, _tid#, slot#, _key#, any #)
         | isTrue# (slot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then (# s1, () #)
@@ -788,7 +835,7 @@ adjustOnThread (ThreadStorageMap tableRef _) tid f = liftIO $ do
       !(I# tidKey#) = getThreadIdInt tid
   IO $ \s0 ->
     case stg_probeSlotByKey# keys# vals# mask# tidKey# s0 of
-      (# s1, slot#, any #)
+      (# s1, slot#, _key#, any #)
         | isTrue# (slot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then (# s1, () #)
@@ -828,7 +875,7 @@ lookupRaw (ThreadStorageMap tableRef _) !tidWord = liftIO $ do
       !(I# tidKey#) = fromIntegral tidWord :: Int
   IO $ \s0 ->
     case stg_probeSlotByKey# keys# vals# mask# tidKey# s0 of
-      (# s1, slot#, any #)
+      (# s1, slot#, _key#, any #)
         | isTrue# (slot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then (# s1, Nothing #)
@@ -851,7 +898,7 @@ updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
   let !(I# mask#) = cap - 1
   IO $ \s0 ->
     case stg_probeSlotByKey# keys# vals# mask# tidKey# s0 of
-      (# s1, rawSlot#, any #)
+      (# s1, rawSlot#, key#, any #)
         | isTrue# (rawSlot# >=# 0#), ref <- asRef any ->
             -- Hot path: attached. See 'update' for the dead check.
             if isDead dead ref
@@ -863,7 +910,7 @@ updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
                       case writeIORef ref new of { IO writeIt -> case writeIt s2 of
                         { (# s3, _ #) -> (# s3, b #) }}
                     (Nothing, !b) ->
-                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) tidKey of
+                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) (I# key#) tidKey of
                         { IO t -> case t s2 of { (# s3, _ #) -> (# s3, b #) }}
                   }}
         | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> miss s1
@@ -872,7 +919,7 @@ updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
               (Nothing, !b) -> (# s1, b #)
               (Just !new, !b) ->
                 let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) tidKey (pure tid) new of
+                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) (I# key#) tidKey (pure tid) new of
                   { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
         where
           miss s = case f Nothing of
@@ -964,7 +1011,7 @@ ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# vals# mask# s0 of
-      (# s1, tid#, rawSlot#, any #)
+      (# s1, tid#, rawSlot#, key#, any #)
         | isTrue# (rawSlot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then slow s1
@@ -972,7 +1019,7 @@ ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
         | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> slow s1
         | otherwise ->
             let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                IO reattach = ensureRefReattach tsm tableRef _cap keys# vals# (I# slot#) (I# tid#) def
+                IO reattach = ensureRefReattach tsm tableRef _cap keys# vals# (I# slot#) (I# key#) (I# tid#) def
             in reattach s1
         where
           IO slow = do
@@ -985,10 +1032,10 @@ ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
 ensureRefReattach
   :: ThreadStorageMap a -> IORef (Table a) -> Int
   -> Exts.MutableByteArray# Exts.RealWorld
-  -> Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> Int -> a -> IO (Int, IORef a)
-ensureRefReattach tsm tableRef origCap keys# vals# slot tidKey def = do
+  -> Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> Int -> Int -> a -> IO (Int, IORef a)
+ensureRefReattach tsm tableRef origCap keys# vals# slot observed tidKey def = do
   newRef <- newIORef def
-  ok <- claimAndPublish keys# vals# slot (tidKey .|. detachedBit) tidKey newRef
+  ok <- claimAndPublish keys# vals# slot observed tidKey newRef
   if ok
     then do
       Table cap' _ _ _ <- readIORef tableRef
@@ -1021,7 +1068,7 @@ lookupRefFast (ThreadStorageMap tableRef _) = do
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# vals# mask# s0 of
-      (# s1, tid#, slot#, any #)
+      (# s1, tid#, slot#, _key#, any #)
         | isTrue# (slot# >=# 0#), ref <- asRef any ->
             if isDead dead ref
               then (# s1, (I# tid#, Nothing) #)
@@ -1127,7 +1174,7 @@ claimSlot overwrite keys# vals# cap home key ref = go home 0
       | steps >= cap = pure False
       | otherwise = do
           k <- readKey keys# slot
-          if k == emptySlot || k == tombstone
+          if k == emptySlot || isTombstone k
             then claimOrRetry slot steps k
             else if (k .&. keyMask) == rawKey
               then if overwrite then claimOrRetry slot steps k else pure True
@@ -1164,7 +1211,7 @@ rehashTable tableRef !oldCap !newCap = do
         | i >= oldCap = pure ()
         | otherwise = do
             (k, ref) <- readSlot oldKeys# oldVals# i
-            when (k /= emptySlot && k /= tombstone && k .&. claimingBit == 0 && not (isDead dead ref)) $ do
+            when (k /= emptySlot && not (isTombstone k) && k .&. claimingBit == 0 && not (isDead dead ref)) $ do
               let !home = slotFor newCap (k .&. keyMask)
               void $ claimSlot False newKeys# newVals# newCap home k ref
             copyLoop (i + 1)
@@ -1187,7 +1234,7 @@ tombstoneSlot
   -> Exts.MutableArray# Exts.RealWorld (IORef a)
   -> IORef a -> Int -> Int -> IORef a -> IO Bool
 tombstoneSlot keys# vals# dead slot observedKey observedRef = do
-  ok <- casKey keys# slot observedKey tombstone
+  ok <- casKey keys# slot observedKey (tombstoneWord observedKey)
   when ok $ void $ casVal vals# slot observedRef dead
   pure ok
 {-# INLINE tombstoneSlot #-}
@@ -1229,10 +1276,10 @@ storedItems (ThreadStorageMap tableRef _) = do
       | i >= cap = pure (reverse acc)
       | otherwise = do
           (k, ref) <- readSlot keys# vals# i
-          if k /= emptySlot && k /= tombstone && k .&. (detachedBit .|. claimingBit) == 0 && not (isDead dead ref)
+          if k /= emptySlot && not (isTombstone k) && k .&. (detachedBit .|. claimingBit) == 0 && not (isDead dead ref)
             then do
               v <- readIORef ref
-              go keys# vals# dead cap (i + 1) ((k, v) : acc)
+              go keys# vals# dead cap (i + 1) ((k .&. keyMask, v) : acc)
             else go keys# vals# dead cap (i + 1) acc
 
 
@@ -1291,8 +1338,8 @@ writeMutInt (MutIntArray arr#) (I# i#) (I# v#) = IO $ \s ->
 -- so a thread that has exited keeps being listed until then, and once it has
 -- been promoted, until the next /major/ GC.
 --
--- The array is left unsorted; the C-side 'c_purge_find_dead' sorts it
--- in place via @qsort@ before scanning.
+-- The array is left unsorted; the C side sorts it in place via @qsort@
+-- before scanning.
 buildLiveSet :: [ThreadId] -> IO (MutIntArray, Int)
 buildLiveSet tids = do
   let !n = length tids
@@ -1328,7 +1375,8 @@ foreign import ccall unsafe "purge_find_dead"
     -> Int                                    -- cap
     -> Exts.MutableByteArray# Exts.RealWorld  -- live set (sorted in place)
     -> Int                                    -- n_live
-    -> Int                                    -- tombstone value
+    -> Int                                    -- tombstone bit
+    -> Int                                    -- mask selecting everything but the version bits
     -> Int                                    -- key_mask for stripping flag bits
     -> Exts.MutableByteArray# Exts.RealWorld  -- dead_out
     -> IO Int                                 -- count of dead slots
@@ -1348,6 +1396,7 @@ foreign import ccall unsafe "purge_find_dead"
 -- SIMD (NEON / SSE2) linear search for small live sets or branchless
 -- binary search (Khuong / Lemire CMOV style) for large ones.  A single
 -- @unsafe ccall@ amortises FFI overhead across the full table scan.
+--
 -- Tombstoning (key + value slot) is done on the Haskell side, by CAS from
 -- the key observed during the scan, so a slot that has since been
 -- re-claimed is never touched; this also maintains GC write barriers.
@@ -1369,7 +1418,7 @@ purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
   tids <- listThreads
   (MutIntArray liveArr#, nLive) <- buildLiveSet tids
   deadArr@(MutIntArray deadArr#) <- newMutIntArray (2 * cap + 1)
-  deadCount <- c_purge_find_dead keys# cap liveArr# nLive tombstone keyMask deadArr#
+  deadCount <- c_purge_find_dead keys# cap liveArr# nLive tombstoneBit (Data.Bits.complement versionMask) keyMask deadArr#
   let tomb !i
         | i > deadCount = pure ()
         | otherwise = do

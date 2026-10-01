@@ -1,6 +1,6 @@
 /*
- * Pure-C regression coverage for the membership dispatcher used by
- * `purgeDeadThreads`.
+ * Pure-C regression coverage for the membership dispatcher and the
+ * purge scan used by `purgeDeadThreads`.
  *
  * This `#include`s cbits/simd_search.c directly so it can access
  * `contains`, `contains_bsearch`, and `LINEAR_THRESHOLD`.
@@ -90,38 +90,42 @@ static const HsInt SIZES[] = {
 
 /* -------------------------------------------------------------------
  * purge_find_dead: exercise the dead_out layout, empty/tombstone
- * skipping, and flag-bit masking. Mirrors the constants in Storage.hs.
+ * skipping, and flag-bit masking (version bits included). Mirrors the
+ * constants in Storage.hs.
  * ------------------------------------------------------------------- */
 #define TOMBSTONE     ((HsInt)1 << 63)
 #define DETACHED_BIT  ((HsInt)1 << 32)
 #define CLAIMING_BIT  ((HsInt)1 << 33)
 #define KEY_MASK      (DETACHED_BIT - 1)
+#define VERSION(n)    ((HsInt)(n) << 34)
+#define TOMB_MASK     (~(VERSION(0x1FFFFFFF)))   /* everything but bits 34..62 */
 
 static void check_purge_scan(void) {
     enum { CAP = 16 };
     HsInt keys[CAP];
     memset(keys, 0, sizeof keys);
-    keys[1]  = 10;                       /* live, attached            */
-    keys[2]  = 11 | DETACHED_BIT;        /* live, detached            */
-    keys[3]  = 20;                       /* dead                      */
-    keys[4]  = 21 | DETACHED_BIT;        /* dead, detached            */
-    keys[5]  = TOMBSTONE;                /* skipped                   */
-    keys[6]  = 22 | CLAIMING_BIT;        /* dead, mid-claim (reported)*/
-    keys[7]  = 30;                       /* dead                      */
-    keys[9]  = 12;                       /* live                      */
+    keys[1]  = 10 | VERSION(3);           /* live, attached, versioned   */
+    keys[2]  = 11 | DETACHED_BIT;         /* live, detached              */
+    keys[3]  = 20;                        /* dead                        */
+    keys[4]  = 21 | DETACHED_BIT;         /* dead, detached              */
+    keys[5]  = TOMBSTONE | VERSION(7);    /* skipped despite its version */
+    keys[6]  = 22 | CLAIMING_BIT;         /* dead, mid-claim (reported)  */
+    keys[7]  = 30 | VERSION(1);           /* dead                        */
+    keys[8]  = TOMBSTONE;                 /* skipped                     */
+    keys[9]  = 12;                        /* live                        */
 
-    HsInt live1[] = { 12, 10, 11 };      /* unsorted on purpose       */
+    HsInt live1[] = { 12, 10, 11 };       /* unsorted on purpose         */
     HsInt dead_out[2 * CAP + 1];
     memset(dead_out, 0x55, sizeof dead_out);
 
-    HsInt n = purge_find_dead(keys, CAP, live1, 3, TOMBSTONE, KEY_MASK, dead_out);
+    HsInt n = purge_find_dead(keys, CAP, live1, 3, TOMBSTONE, TOMB_MASK, KEY_MASK, dead_out);
     CHECK(n == 4, "purge_find_dead: count = %lld, expected 4", (long long)n);
     CHECK(dead_out[0] == 7, "purge_find_dead: occupied = %lld, expected 7", (long long)dead_out[0]);
     CHECK(live1[0] == 10 && live1[1] == 11 && live1[2] == 12, "purge_find_dead: live set not sorted");
 
     /* Entries are in slot order with the observed key word, flags intact. */
     const HsInt exp_slots[] = { 3, 4, 6, 7 };
-    const HsInt exp_keys[]  = { 20, 21 | DETACHED_BIT, 22 | CLAIMING_BIT, 30 };
+    const HsInt exp_keys[]  = { 20, 21 | DETACHED_BIT, 22 | CLAIMING_BIT, 30 | VERSION(1) };
     for (HsInt i = 0; i < n && i < 4; i++) {
         CHECK(dead_out[1 + 2 * i] == exp_slots[i],
               "purge_find_dead: entry %lld slot = %lld, expected %lld",
@@ -132,9 +136,8 @@ static void check_purge_scan(void) {
     }
 
     /* Empty live set: everything occupied is dead. */
-    HsInt n0 = purge_find_dead(keys, CAP, live1, 0, TOMBSTONE, KEY_MASK, dead_out);
-    CHECK(n0 == 7, "purge_find_dead(n_live=0): count = %lld, expected 7", (long long)n0);
-}
+    HsInt n0 = purge_find_dead(keys, CAP, live1, 0, TOMBSTONE, TOMB_MASK, KEY_MASK, dead_out);
+    CHECK(n0 == 7, "purge_find_dead(n_live=0): count = %lld, expected 7", (long long)n0);}
 
 int main(void) {
     static HsInt buf[8 * LINEAR_THRESHOLD];

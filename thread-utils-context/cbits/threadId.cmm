@@ -35,15 +35,18 @@
 // The two acquire loads order the three loads (key <= ref <= key2) on
 // weakly ordered hardware without a full fence; on x86 they are plain
 // moves. Since a slot cannot change hands without its key passing
-// through CLAIMING or TOMBSTONE, key2 == key means `ref` was the value
-// published for `key` (barring the theoretical two-republish ABA within
-// one read, which a version counter in the spare key bits would close).
+// through CLAIMING or TOMBSTONE, and every publication bumps the version
+// bits, key2 == key means `ref` was the value published for `key` -- even
+// if the slot was recycled back to the same tid in between.
 // -----------------------------------------------------------------------
 
 #define HASH_SALT     0x9E3779B97F4A7C15
 #define DETACHED_BIT  0x0000000100000000
 #define CLAIMING_BIT  0x0000000200000000
 #define KEY_MASK      0x00000000FFFFFFFF
+// Bits 34..62 hold a per-slot publication counter; see Storage.hs. The
+// probes compare whole words, so it participates in the seqlock check
+// automatically and closes the same-tid ABA case.
 
 #define KEY_ADDR(keys, slot) ((keys) + SIZEOF_StgArrBytes   + WDS(slot))
 #define VAL_ADDR(vals, slot) ((vals) + SIZEOF_StgMutArrPtrs + WDS(slot))
@@ -102,12 +105,14 @@ stg_readSlot(P_ keys, P_ vals, W_ slot)
 //   P_ vals  : MutableArray# holding the IORef per slot
 //   W_ mask  : table capacity - 1 (for bitwise AND)
 //
-// Returns: (Int# tid, Int# slot, P_ ref)
-//   slot >= 0   -> entry found and attached at that index; ref is its
-//                  value, read consistently with the key
-//   slot == -1  -> entry not found; ref is a placeholder (keys)
+// Returns: (Int# tid, Int# slot, Int# key, P_ ref)
+//   slot >= 0   -> entry found and attached at that index; key is the
+//                  full key word observed there and ref its value, read
+//                  consistently with that key
+//   slot == -1  -> entry not found; key is 0, ref a placeholder (keys)
 //   slot <= -2  -> entry found but detached; real index = -(slot+2);
-//                  ref is a placeholder (keys)
+//                  key is the observed word (CAS against it to
+//                  re-attach), ref a placeholder (keys)
 // -----------------------------------------------------------------------
 
 stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
@@ -128,9 +133,9 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
             // Owner is mid-write; invisible until published.
             goto next;
         }
-        if (key != tid) {
+        if ((key & DETACHED_BIT) != 0) {
             // Key matches but detached bit is set.
-            return (tid, 0 - slot - 2, keys);
+            return (tid, 0 - slot - 2, key, keys);
         }
         (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
         key2 = W_[KEY_ADDR(keys, slot)];
@@ -138,11 +143,11 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
             // Slot changed under us; re-examine it from scratch.
             goto again;
         }
-        return (tid, slot, ref);
+        return (tid, slot, key, ref);
     }
 
     if (key == 0) {
-        return (tid, -1, keys);
+        return (tid, -1, 0, keys);
     }
 
   next:
@@ -151,7 +156,7 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
         goto again;
     }
 
-    return (tid, -1, keys);
+    return (tid, -1, 0, keys);
 }
 
 
@@ -167,7 +172,7 @@ stg_probeThreadSlot(P_ keys, P_ vals, W_ mask)
 //   W_ mask  : table capacity - 1
 //   W_ tid   : the raw key to search for (lower 32 bits only)
 //
-// Returns: (Int# slot, P_ ref)  (same encoding as stg_probeThreadSlot)
+// Returns: (Int# slot, Int# key, P_ ref)  (same encoding as stg_probeThreadSlot)
 // -----------------------------------------------------------------------
 
 stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
@@ -186,19 +191,19 @@ stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
         if ((key & CLAIMING_BIT) != 0) {
             goto next;
         }
-        if (key != tid) {
-            return (0 - slot - 2, keys);
+        if ((key & DETACHED_BIT) != 0) {
+            return (0 - slot - 2, key, keys);
         }
         (ref) = prim %load_acquire64(VAL_ADDR(vals, slot));
         key2 = W_[KEY_ADDR(keys, slot)];
         if (key2 != key) {
             goto again;
         }
-        return (slot, ref);
+        return (slot, key, ref);
     }
 
     if (key == 0) {
-        return (-1, keys);
+        return (-1, 0, keys);
     }
 
   next:
@@ -207,5 +212,5 @@ stg_probeSlotByKey(P_ keys, P_ vals, W_ mask, W_ tid)
         goto again;
     }
 
-    return (-1, keys);
+    return (-1, 0, keys);
 }

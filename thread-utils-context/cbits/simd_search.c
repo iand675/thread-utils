@@ -159,7 +159,9 @@ static int cmp_hsint(const void *a, const void *b) {
  * ccall to amortise FFI overhead across the full table scan.
  *
  * Sorts live[] in place (needed for the binary search fallback when
- * n_live > LINEAR_THRESHOLD), then scans keys[0..cap).
+ * n_live > LINEAR_THRESHOLD), then scans keys[0..cap). A slot is
+ * occupied iff its key is non-zero and, with the version bits masked
+ * off by tomb_mask, is not the tombstone.
  *
  * Output layout in dead_out (must have room for 2 * cap + 1 elements):
  *   dead_out[0]        = total occupied slots (for shrink decisions)
@@ -181,6 +183,7 @@ HsInt purge_find_dead(
     HsInt *live,
     HsInt n_live,
     HsInt tombstone_val,
+    HsInt tomb_mask,
     HsInt key_mask,
     HsInt *dead_out)
 {
@@ -191,7 +194,8 @@ HsInt purge_find_dead(
     HsInt occupied = 0;
     for (HsInt i = 0; i < cap; i++) {
         HsInt k = keys[i];
-        if (k != 0 && k != tombstone_val) {
+        /* A tombstone keeps its version bits; strip them before comparing. */
+        if (k != 0 && (k & tomb_mask) != tombstone_val) {
             occupied++;
             HsInt raw_k = k & key_mask;
             if (!contains(raw_k, live, n_live)) {
