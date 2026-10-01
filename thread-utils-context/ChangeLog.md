@@ -10,6 +10,11 @@
   error call of the map's element type, so unsafe access is well-typed (panics)
   instead of being a failed `unsafeCoerce#`; identity is tested `sameMutVar#`
   via `IORef`'s `Eq` instance now, instead of `reallyUnsafePtrEquality#`.
+- Every write to the value array is now bracketed by a CAS of the key into
+  a transient "claiming" state (bit 33) that's skipped by the probe, so a key
+  can never be observed as corresponding to a different key's value.
+  Tombstoning is a CAS from the observed key, then a CAS of the value, so the
+  tombstone never ends up in a slot that has since been re-claimed.
 - Add pure-C coverage for the purge scan.
 
 ## 0.4.1.1

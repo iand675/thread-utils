@@ -161,9 +161,14 @@ static int cmp_hsint(const void *a, const void *b) {
  * Sorts live[] in place (needed for the binary search fallback when
  * n_live > LINEAR_THRESHOLD), then scans keys[0..cap).
  *
- * Output layout in dead_out (must have room for cap + 1 elements):
- *   dead_out[0]          = total occupied slots (for shrink decisions)
- *   dead_out[1 .. count] = indices of dead slots
+ * Output layout in dead_out (must have room for 2 * cap + 1 elements):
+ *   dead_out[0]        = total occupied slots (for shrink decisions)
+ *   dead_out[2i - 1]   = slot index of the i-th dead entry (1 <= i <= count)
+ *   dead_out[2i]       = key word observed in that slot, flag bits included
+ *
+ * The observed key is reported so the Haskell side can tombstone by CAS:
+ * if the slot has changed hands since the scan, the CAS fails and the
+ * new occupant is left alone.
  *
  * Returns the count of dead slots found.
  *
@@ -189,8 +194,11 @@ HsInt purge_find_dead(
         if (k != 0 && k != tombstone_val) {
             occupied++;
             HsInt raw_k = k & key_mask;
-            if (!contains(raw_k, live, n_live))
-                dead_out[1 + dead_count++] = i;
+            if (!contains(raw_k, live, n_live)) {
+                dead_out[1 + 2 * dead_count] = i;
+                dead_out[2 + 2 * dead_count] = k;
+                dead_count++;
+            }
         }
     }
     dead_out[0] = occupied;

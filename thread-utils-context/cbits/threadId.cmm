@@ -4,11 +4,18 @@
 // Key encoding
 //
 // Thread IDs are StgWord32, occupying the low 32 bits of each key slot.
-// Bit 32 serves as a "detached" flag: set when the user detaches a
-// context, cleared on re-attach.  The probe masks this bit when
-// comparing against the target tid and encodes the detached state in
-// the return value so the Haskell side never touches the value array
-// for detached slots.
+// Two flag bits sit above the ID:
+//
+//   bit 32, DETACHED: set when the user detaches a context, cleared on
+//     re-attach. The probe masks this bit when comparing against the
+//     target tid and encodes the detached state in the return value so
+//     the Haskell side never touches the value array for detached slots.
+//
+//   bit 33, CLAIMING: set by the owner between CAS-ing the key and
+//     writing the value slot (see claimAndPublish in Storage.hs). A slot
+//     in this state is treated as *not matching* -- the probe keeps
+//     walking -- so a key is never observed paired with a value that
+//     has not been written for it yet.
 //
 // Slot hashing uses a Fibonacci/golden-ratio multiplicative hash
 // to spread sequential thread IDs across cache lines, avoiding false
@@ -17,6 +24,7 @@
 
 #define HASH_SALT     0x9E3779B97F4A7C15
 #define DETACHED_BIT  0x0000000100000000
+#define CLAIMING_BIT  0x0000000200000000
 #define KEY_MASK      0x00000000FFFFFFFF
 
 // -----------------------------------------------------------------------
@@ -62,6 +70,10 @@ stg_probeThreadSlot(P_ keys, W_ mask)
     raw_key = key & KEY_MASK;
 
     if (raw_key == tid) {
+        if ((key & CLAIMING_BIT) != 0) {
+            // Owner is mid-write; invisible until published.
+            goto next;
+        }
         if (key != tid) {
             // Key matches but detached bit is set.
             return (tid, 0 - slot - 2);
@@ -73,6 +85,7 @@ stg_probeThreadSlot(P_ keys, W_ mask)
         return (tid, -1);
     }
 
+  next:
     slot = (slot + 1) & mask;
     if (slot != home) {
         goto again;
@@ -109,6 +122,9 @@ stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
     raw_key = key & KEY_MASK;
 
     if (raw_key == tid) {
+        if ((key & CLAIMING_BIT) != 0) {
+            goto next;
+        }
         if (key != tid) {
             return (0 - slot - 2);
         }
@@ -119,6 +135,7 @@ stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
         return (-1);
     }
 
+  next:
     slot = (slot + 1) & mask;
     if (slot != home) {
         goto again;
