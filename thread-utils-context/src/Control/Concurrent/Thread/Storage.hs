@@ -168,7 +168,7 @@ import Data.Bits (countLeadingZeros, finiteBitSize, unsafeShiftL, (.&.), (.|.))
 import Data.IORef
 import Foreign.C.Types (CULLong (..))
 import Foreign.Storable (sizeOf)
-import GHC.Conc (getNumCapabilities, yield)
+import GHC.Conc (getNumCapabilities)
 import GHC.Conc.Sync (ThreadId (..))
 import GHC.Exts (Int (..), Int#, ThreadId#, isTrue#, (==#), (>=#))
 import qualified GHC.Exts as Exts
@@ -1077,7 +1077,9 @@ insertNew tsm@(ThreadStorageMap tableRef resizeLock) tid !tidKey val = do
 
       -- A resize may have published a new table while we were claiming a
       -- slot in the old one. If our key is not in the current table, redo
-      -- the insert there.
+      -- the insert there. (A claim that landed after the resizer's first
+      -- pass but before publication is picked up by its second pass; see
+      -- 'rehashTable'.)
       ensureCurrent = do
         Table cap keys# vals# _ <- readIORef tableRef
         let !home = slotFor cap tidKey
@@ -1100,7 +1102,9 @@ insertNew tsm@(ThreadStorageMap tableRef resizeLock) tid !tidKey val = do
 -- is re-read: the key changed under us, so there is always progress.
 --
 -- With @overwrite = False@ a slot that already carries @key@ (in any
--- state) is left alone and counted as success.
+-- state) is left alone and counted as success. 'rehashTable' uses that
+-- mode so its second pass never clobbers a value the owner has since
+-- replaced in the new table.
 claimSlot :: Bool -> Exts.MutableByteArray# Exts.RealWorld -> Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> Int -> Int -> IORef a -> IO Bool
 claimSlot overwrite keys# vals# cap home key ref = go home 0
   where
@@ -1127,6 +1131,17 @@ claimSlot overwrite keys# vals# cap home key ref = go home 0
 -- Used for both growing (double capacity) and shrinking (after purge).
 -- Keys are copied verbatim (including detached bit) so the detached
 -- state survives resize.  Home slot computed from the raw thread ID.
+--
+-- Slots that are empty, tombstoned, or mid-claim are skipped; a claim in
+-- flight is completed by its owner, whose 'insertNew' re-checks the
+-- current table afterwards. The copy runs twice -- once before and once
+-- after publication -- so a claim that lands after the first pass has
+-- visited its slot, but whose owner re-checked before publication, is
+-- still carried over. The second pass only adds keys that are absent.
+--
+-- A shrink target is computed from a point-in-time count, so a burst of
+-- inserts during the copy can overfill the smaller table; entries that do
+-- not fit are dropped and re-inserted lazily by their owners' next write.
 rehashTable :: IORef (Table a) -> Int -> Int -> IO ()
 rehashTable tableRef !oldCap !newCap = do
   Table _ oldKeys# oldVals# dead <- readIORef tableRef
@@ -1135,21 +1150,19 @@ rehashTable tableRef !oldCap !newCap = do
         | i >= oldCap = pure ()
         | otherwise = do
             k <- readKey oldKeys# i
-            if k /= emptySlot && k /= tombstone
-              then do
-                oldRef <- readVal oldVals# i
-                if isDead dead oldRef
-                  then do
-                    yield
-                    copyLoop i
-                  else do
-                    let !rawKey = k .&. keyMask
-                        !home = slotFor newCap rawKey
-                    _ <- claimSlot True newKeys# newVals# newCap home k oldRef
-                    copyLoop (i + 1)
-              else copyLoop (i + 1)
+            when (k /= emptySlot && k /= tombstone && k .&. claimingBit == 0) $ do
+              ref <- readVal oldVals# i
+              -- Re-read the key: if it changed, the (key, value) pair we
+              -- hold is torn (tombstoned or re-claimed in between) and must
+              -- not be copied. The owner or the second pass will sort it out.
+              k' <- readKey oldKeys# i
+              when (k' == k && not (isDead dead ref)) $ do
+                let !home = slotFor newCap (k .&. keyMask)
+                void $ claimSlot False newKeys# newVals# newCap home k ref
+            copyLoop (i + 1)
   copyLoop 0
   writeIORef tableRef newTable
+  copyLoop 0
 
 
 growTable :: IORef (Table a) -> Int -> IO ()
