@@ -54,6 +54,15 @@
 -- Haskell hot path for 'lookup' and 'adjust' never checks the value
 -- array for detached markers at all.
 --
+-- == Dead slots
+--
+-- A key and its value are two separately written words, so a probe can
+-- match a key whose value slot has just been cleared by a tombstoner.
+-- Cleared slots hold the map's /dead-slot placeholder/: an 'IORef' of the
+-- map's own element type allocated once per map, so even an unintended
+-- dereference is well-typed. Every read path checks for it with 'isDead'
+-- and reports the entry as absent.
+--
 -- == Choosing an API tier
 --
 -- This module exposes three tiers of API, from simplest to fastest:
@@ -150,10 +159,9 @@ import Foreign.C.Types (CULLong (..))
 import Foreign.Storable (sizeOf)
 import GHC.Conc (getNumCapabilities, yield)
 import GHC.Conc.Sync (ThreadId (..))
-import GHC.Exts (Int (..), Int#, ThreadId#, isTrue#, unsafeCoerce#, (==#), (>=#))
+import GHC.Exts (Int (..), Int#, ThreadId#, isTrue#, (==#), (>=#))
 import qualified GHC.Exts as Exts
 import GHC.IO (IO (..))
-import System.IO.Unsafe (unsafePerformIO)
 #if MIN_VERSION_base(4,18,0)
 import GHC.Conc (ThreadStatus (..), listThreads, threadStatus)
 #endif
@@ -248,30 +256,6 @@ tombstone :: Int
 tombstone = minBound
 
 
--- | Sentinel for uninitialized value-array slots. A single global CAF so
--- that 'isSentinel' can detect it via pointer identity.  The value is
--- never read; only the pointer matters.
-{-# NOINLINE sentinelRef #-}
-sentinelRef :: IORef ()
-sentinelRef = unsafePerformIO (newIORef ())
-
-
--- | Cast the sentinel to any @IORef a@ for use in value arrays.
-toSentinel :: IORef a
-toSentinel = unsafeCoerce# sentinelRef
-{-# INLINE toSentinel #-}
-
-
--- | Pointer-identity check against the module-level sentinel.
---
--- 'Exts.reallyUnsafePtrEquality#' may return a false negative on GC
--- boundaries, but never a false positive. A false negative in 'growTable'
--- just causes one extra spin iteration, which is harmless.
-isSentinel :: IORef a -> Bool
-isSentinel ref = isTrue# (Exts.reallyUnsafePtrEquality# (unsafeCoerce# ref :: IORef ()) sentinelRef)
-{-# INLINE isSentinel #-}
-
-
 -- | Bit 32, set in a key slot to mark "detached by user".  Thread IDs
 -- are 32-bit ('StgWord32'), so this bit is always free.
 detachedBit :: Int
@@ -302,10 +286,19 @@ nextPow2 n
 ---------------------------------------------------------------------------
 
 -- | The raw hash table arrays. Swapped atomically on resize.
+--
+-- The last field is this map's /dead-slot placeholder/: the 'IORef' that
+-- fills every value slot whose key is empty or tombstoned. It is allocated
+-- once per map at the map's own element type, so even if a bug were to hand
+-- it to a caller, reading it yields a well-typed error thunk and writing it
+-- stores a well-typed value -- never another map's heap object. Identity is
+-- tested with 'isDead', which compares the underlying 'Exts.MutVar#', so
+-- unpacking the box here (and re-boxing it in 'allocateTable') is harmless.
 data Table a = Table
   {-# UNPACK #-} !Int -- capacity (power of 2)
   (Exts.MutableByteArray# Exts.RealWorld) -- keys: Int per slot
   (Exts.MutableArray# Exts.RealWorld (IORef a)) -- values: GC-traced
+  {-# UNPACK #-} !(IORef a) -- dead-slot placeholder
 
 
 -- | A concurrent map from green-thread IDs to values of type @a@.
@@ -328,6 +321,23 @@ data ThreadStorageMap a = ThreadStorageMap
 ---------------------------------------------------------------------------
 -- Helpers
 ---------------------------------------------------------------------------
+
+-- | Allocate a map's dead-slot placeholder. The payload is never meant to
+-- be read; if it is, the error names the library so the report lands here.
+newDeadRef :: IO (IORef a)
+newDeadRef = newIORef $ errorWithoutStackTrace
+  "thread-utils-context: dereferenced a dead slot's placeholder; this is a bug in thread-utils-context"
+
+
+-- | Is @ref@ this table's dead-slot placeholder?
+--
+-- 'Eq' on 'IORef' is @sameMutVar#@ on the underlying 'Exts.MutVar#', which
+-- is an exact identity test with none of the tagging or indirection
+-- caveats of 'Exts.reallyUnsafePtrEquality#'.
+isDead :: IORef a -> IORef a -> Bool
+isDead dead ref = dead == ref
+{-# INLINE isDead #-}
+
 
 slotFor :: Int -> Int -> Int
 slotFor cap tid = (tid * hashSalt) .&. (cap - 1)
@@ -391,17 +401,17 @@ probeFind keys# vals# cap home key = go home 0
 -- Construction
 ---------------------------------------------------------------------------
 
-allocateTable :: Int -> IO (Table a)
-allocateTable requested = IO $ \s0 ->
+allocateTable :: IORef a -> Int -> IO (Table a)
+allocateTable dead requested = IO $ \s0 ->
   let !cap = nextPow2 (max 16 requested)
       !(I# cap#) = cap
       !(I# bytes#) = cap * sizeOf (0 :: Int)
   in case Exts.newByteArray# bytes# s0 of
     (# s1, keys# #) ->
       case Exts.setByteArray# keys# 0# bytes# 0# s1 of
-        s2 -> case Exts.newArray# cap# toSentinel s2 of
+        s2 -> case Exts.newArray# cap# dead s2 of
           (# s3, vals# #) ->
-            (# s3, Table cap keys# vals# #)
+            (# s3, Table cap keys# vals# dead #)
 
 
 -- | Create a 'ThreadStorageMap' with a default initial capacity derived from
@@ -425,7 +435,8 @@ newThreadStorageMap = liftIO $ do
 -- below 0.7 keeps probe chains short; resizing also cleans tombstones.
 newThreadStorageMapWith :: (MonadIO m) => Int -> m (ThreadStorageMap a)
 newThreadStorageMapWith requested = liftIO $ do
-  table <- allocateTable requested
+  dead <- newDeadRef
+  table <- allocateTable dead requested
   ref <- newIORef table
   lock <- newMVar ()
   pure (ThreadStorageMap ref lock)
@@ -453,16 +464,18 @@ newThreadStorageMapWith requested = liftIO $ do
 -- without touching the value array in the detached case.
 lookup :: (MonadIO m) => ThreadStorageMap a -> m (Maybe a)
 lookup (ThreadStorageMap tableRef _) = liftIO $ do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# mask# s0 of
       (# s1, _tid#, slot# #)
         | isTrue# (slot# >=# 0#) ->
             case Exts.readArray# vals# slot# s1 of
-              (# s2, ref #) ->
-                case readIORef ref of { IO f -> case f s2 of
-                  { (# s3, val #) -> (# s3, Just val #) }}
+              (# s2, ref #)
+                | isDead dead ref -> (# s2, Nothing #)
+                | otherwise ->
+                    case readIORef ref of { IO f -> case f s2 of
+                      { (# s3, val #) -> (# s3, Just val #) }}
         | otherwise -> (# s1, Nothing #)
 {-# INLINE lookup #-}
 
@@ -528,7 +541,7 @@ detachFromThread tsm tid =
 -- @
 update :: (MonadIO m) => ThreadStorageMap a -> (Maybe a -> (Maybe a, b)) -> m b
 update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   IO $ \s0 ->
     let !(I# mask#) = cap - 1
     in case stg_probeThreadSlot# keys# mask# s0 of
@@ -536,28 +549,36 @@ update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
         | isTrue# (rawSlot# >=# 0#) ->
             -- Hot path: attached
             case Exts.readArray# vals# rawSlot# s1 of
-              (# s2, ref #) ->
-                case readIORef ref of { IO readIt -> case readIt s2 of
-                  { (# s3, old #) -> case f (Just old) of
-                    (Just !new, !b) ->
-                      case writeIORef ref new of { IO writeIt -> case writeIt s3 of
-                        { (# s4, _ #) -> (# s4, b #) }}
-                    (Nothing, !b) ->
-                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) (I# tid#) of
-                        { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
-                  }}
+              (# s2, ref #)
+                -- The key matched but the value slot has already been
+                -- cleared by a concurrent tombstoner: treat as absent.
+                | isDead dead ref -> miss s2
+                | otherwise ->
+                    case readIORef ref of { IO readIt -> case readIt s2 of
+                      { (# s3, old #) -> case f (Just old) of
+                        (Just !new, !b) ->
+                          case writeIORef ref new of { IO writeIt -> case writeIt s3 of
+                            { (# s4, _ #) -> (# s4, b #) }}
+                        (Nothing, !b) ->
+                          case updateDetach tsm tableRef cap keys# (I# rawSlot#) (I# tid#) of
+                            { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
+                      }}
+        | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> miss s1
         | otherwise ->
-            -- Not found or detached
+            -- Found but detached: re-attach in place.
             case f Nothing of
               (Nothing, !b) -> (# s1, b #)
-              (Just !new, !b)
-                | isTrue# (rawSlot# ==# Exts.negateInt# 1#) ->
-                    case updateColdInsert tsm (I# tid#) new of
-                      { IO ins -> case ins s1 of { (# s2, _ #) -> (# s2, b #) }}
-                | otherwise ->
-                    let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                    in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) (I# tid#) new of
-                      { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
+              (Just !new, !b) ->
+                let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
+                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) (I# tid#) new of
+                  { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
+        where
+          -- Not found: insert fresh if the callback produces a value.
+          miss s = case f Nothing of
+            (Nothing, !b) -> (# s, b #)
+            (Just !new, !b) ->
+              case updateColdInsert tsm (I# tid#) new of
+                { IO ins -> case ins s of { (# s', _ #) -> (# s', b #) }}
 {-# INLINE update #-}
 
 
@@ -572,7 +593,7 @@ updateDetach
   -> Int -> Int -> IO ()
 updateDetach tsm tableRef cap keys# slot tidKey = do
   writeKey keys# slot (tidKey .|. detachedBit)
-  Table cap' _ _ <- readIORef tableRef
+  Table cap' _ _ _ <- readIORef tableRef
   when (cap' /= cap) $ propagateDetach tsm tidKey
 {-# NOINLINE updateDetach #-}
 
@@ -592,7 +613,7 @@ reattachSlot tsm tableRef origCap keys# vals# slot tidKey new = do
   newRef <- newIORef new
   writeVal vals# slot newRef
   writeKey keys# slot tidKey
-  Table cap' _ _ <- readIORef tableRef
+  Table cap' _ _ _ <- readIORef tableRef
   when (cap' /= origCap) $ propagateRef tsm tidKey newRef
 {-# NOINLINE reattachSlot #-}
 
@@ -600,13 +621,13 @@ reattachSlot tsm tableRef origCap keys# vals# slot tidKey new = do
 -- Propagate a detach marker to the current table after a concurrent resize.
 propagateDetach :: ThreadStorageMap a -> Int -> IO ()
 propagateDetach tsm@(ThreadStorageMap tableRef _) tidKey = do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# _ <- readIORef tableRef
   let !home = slotFor cap tidKey
   found <- probeFind keys# vals# cap home tidKey
   case found of
     Just (!slot, _) -> do
       writeKey keys# slot (tidKey .|. detachedBit)
-      Table cap' _ _ <- readIORef tableRef
+      Table cap' _ _ _ <- readIORef tableRef
       when (cap' /= cap) $ propagateDetach tsm tidKey
     Nothing -> pure ()
 {-# NOINLINE propagateDetach #-}
@@ -615,7 +636,7 @@ propagateDetach tsm@(ThreadStorageMap tableRef _) tidKey = do
 -- Propagate a re-attached IORef to the current table after a concurrent resize.
 propagateRef :: ThreadStorageMap a -> Int -> IORef a -> IO ()
 propagateRef tsm@(ThreadStorageMap tableRef _) tidKey ref = do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# _ <- readIORef tableRef
   let !home = slotFor cap tidKey
   found <- probeFind keys# vals# cap home tidKey
   case found of
@@ -624,7 +645,7 @@ propagateRef tsm@(ThreadStorageMap tableRef _) tidKey ref = do
       when (k .&. detachedBit /= 0) $ do
         writeVal vals# slot ref
         writeKey keys# slot tidKey
-        Table cap' _ _ <- readIORef tableRef
+        Table cap' _ _ _ <- readIORef tableRef
         when (cap' /= cap) $ propagateRef tsm tidKey ref
     Nothing -> pure ()
 {-# NOINLINE propagateRef #-}
@@ -661,15 +682,17 @@ updateOnThread tsm tid f = liftIO $ updateRaw tsm tid (getThreadId tid) f
 -- The modification is strict ('modifyIORef'').  Uses the fused CMM probe.
 adjust :: (MonadIO m) => ThreadStorageMap a -> (a -> a) -> m ()
 adjust (ThreadStorageMap tableRef _) f = liftIO $ do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# mask# s0 of
       (# s1, _tid#, slot# #)
         | isTrue# (slot# >=# 0#) ->
             case Exts.readArray# vals# slot# s1 of
-              (# s2, ref #) ->
-                case modifyIORef' ref f of { IO g -> g s2 }
+              (# s2, ref #)
+                | isDead dead ref -> (# s2, () #)
+                | otherwise ->
+                    case modifyIORef' ref f of { IO g -> g s2 }
         | otherwise -> (# s1, () #)
 {-# INLINE adjust #-}
 
@@ -677,7 +700,7 @@ adjust (ThreadStorageMap tableRef _) f = liftIO $ do
 -- | Like 'adjust', but targets a specific thread.
 adjustOnThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> (a -> a) -> m ()
 adjustOnThread (ThreadStorageMap tableRef _) tid f = liftIO $ do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   let !(I# mask#) = _cap - 1
       !(I# tidKey#) = getThreadIdInt tid
   IO $ \s0 ->
@@ -685,8 +708,10 @@ adjustOnThread (ThreadStorageMap tableRef _) tid f = liftIO $ do
       (# s1, slot# #)
         | isTrue# (slot# >=# 0#) ->
             case Exts.readArray# vals# slot# s1 of
-              (# s2, ref #) ->
-                case modifyIORef' ref f of { IO g -> g s2 }
+              (# s2, ref #)
+                | isDead dead ref -> (# s2, () #)
+                | otherwise ->
+                    case modifyIORef' ref f of { IO g -> g s2 }
         | otherwise -> (# s1, () #)
 {-# INLINE adjustOnThread #-}
 
@@ -717,7 +742,7 @@ adjustOnThread (ThreadStorageMap tableRef _) tid f = liftIO $ do
 -- make internally. Uses a CMM primop for the key-array probe.
 lookupRaw :: (MonadIO m) => ThreadStorageMap a -> Word -> m (Maybe a)
 lookupRaw (ThreadStorageMap tableRef _) !tidWord = liftIO $ do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   let !(I# mask#) = _cap - 1
       !(I# tidKey#) = fromIntegral tidWord :: Int
   IO $ \s0 ->
@@ -725,9 +750,11 @@ lookupRaw (ThreadStorageMap tableRef _) !tidWord = liftIO $ do
       (# s1, slot# #)
         | isTrue# (slot# >=# 0#) ->
             case Exts.readArray# vals# slot# s1 of
-              (# s2, ref #) ->
-                case readIORef ref of { IO f -> case f s2 of
-                  { (# s3, val #) -> (# s3, Just val #) }}
+              (# s2, ref #)
+                | isDead dead ref -> (# s2, Nothing #)
+                | otherwise ->
+                    case readIORef ref of { IO f -> case f s2 of
+                      { (# s3, val #) -> (# s3, Just val #) }}
         | otherwise -> (# s1, Nothing #)
 {-# INLINE lookupRaw #-}
 
@@ -741,7 +768,7 @@ lookupRaw (ThreadStorageMap tableRef _) !tidWord = liftIO $ do
 updateRaw :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> Word -> (Maybe a -> (Maybe a, b)) -> m b
 updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
   let !tidKey@(I# tidKey#) = fromIntegral tidWord :: Int
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   let !(I# mask#) = cap - 1
   IO $ \s0 ->
     case stg_probeSlotByKey# keys# mask# tidKey# s0 of
@@ -749,27 +776,33 @@ updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
         | isTrue# (rawSlot# >=# 0#) ->
             -- Hot path: attached
             case Exts.readArray# vals# rawSlot# s1 of
-              (# s2, ref #) ->
-                case readIORef ref of { IO readIt -> case readIt s2 of
-                  { (# s3, old #) -> case f (Just old) of
-                    (Just !new, !b) ->
-                      case writeIORef ref new of { IO writeIt -> case writeIt s3 of
-                        { (# s4, _ #) -> (# s4, b #) }}
-                    (Nothing, !b) ->
-                      case updateDetach tsm tableRef cap keys# (I# rawSlot#) tidKey of
-                        { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
-                  }}
+              (# s2, ref #)
+                -- See 'update' for why a dead placeholder is a miss.
+                | isDead dead ref -> miss s2
+                | otherwise ->
+                    case readIORef ref of { IO readIt -> case readIt s2 of
+                      { (# s3, old #) -> case f (Just old) of
+                        (Just !new, !b) ->
+                          case writeIORef ref new of { IO writeIt -> case writeIt s3 of
+                            { (# s4, _ #) -> (# s4, b #) }}
+                        (Nothing, !b) ->
+                          case updateDetach tsm tableRef cap keys# (I# rawSlot#) tidKey of
+                            { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
+                      }}
+        | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> miss s1
         | otherwise ->
             case f Nothing of
               (Nothing, !b) -> (# s1, b #)
-              (Just !new, !b)
-                | isTrue# (rawSlot# ==# Exts.negateInt# 1#) ->
-                    case updateColdInsertTid tsm tid tidKey new of
-                      { IO ins -> case ins s1 of { (# s2, _ #) -> (# s2, b #) }}
-                | otherwise ->
-                    let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                    in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) tidKey new of
-                      { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
+              (Just !new, !b) ->
+                let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
+                in case reattachSlot tsm tableRef cap keys# vals# (I# slot#) tidKey new of
+                  { IO re -> case re s1 of { (# s2, _ #) -> (# s2, b #) }}
+        where
+          miss s = case f Nothing of
+            (Nothing, !b) -> (# s, b #)
+            (Just !new, !b) ->
+              case updateColdInsertTid tsm tid tidKey new of
+                { IO ins -> case ins s of { (# s', _ #) -> (# s', b #) }}
 {-# INLINE updateRaw #-}
 
 
@@ -814,7 +847,7 @@ updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
 -- 'getCurrentThreadId' or @fromIntegral . 'getThreadId'@).
 ensureRef :: ThreadStorageMap a -> ThreadId -> Int -> a -> IO (IORef a)
 ensureRef tsm@(ThreadStorageMap tableRef _) tid !tidKey def = do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   let !home = slotFor cap tidKey
   result <- probeFind keys# vals# cap home tidKey
   case result of
@@ -825,10 +858,15 @@ ensureRef tsm@(ThreadStorageMap tableRef _) tid !tidKey def = do
           newRef <- newIORef def
           writeVal vals# slot newRef
           writeKey keys# slot tidKey
-          Table cap' _ _ <- readIORef tableRef
+          Table cap' _ _ _ <- readIORef tableRef
           when (cap' /= cap) $ propagateRef tsm tidKey newRef
           pure newRef
-        else pure ref
+        -- The key matched, but a concurrent tombstoner has already cleared
+        -- the slot; handing back the placeholder would let the caller hold
+        -- and dereference it indefinitely. Treat exactly like not-found.
+        else if isDead dead ref
+          then insertNew tsm tid tidKey def
+          else pure ref
     Nothing -> insertNew tsm tid tidKey def
 {-# INLINE ensureRef #-}
 
@@ -846,24 +884,27 @@ ensureRef tsm@(ThreadStorageMap tableRef _) tid !tidKey def = do
 -- 'IORef' initialised to @def@, and registers a finalizer.
 ensureRefFast :: ThreadStorageMap a -> a -> IO (Int, IORef a)
 ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# mask# s0 of
       (# s1, tid#, rawSlot# #)
         | isTrue# (rawSlot# >=# 0#) ->
             case Exts.readArray# vals# rawSlot# s1 of
-              (# s2, ref #) -> (# s2, (I# tid#, ref) #)
-        | isTrue# (rawSlot# ==# Exts.negateInt# 1#) ->
-            let IO slow = do
-                  tid <- myThreadId
-                  ref <- insertNew tsm tid (I# tid#) def
-                  pure (I# tid#, ref)
-            in slow s1
+              (# s2, ref #)
+                -- Same hazard as noted in 'ensureRef'.
+                | isDead dead ref -> slow s2
+                | otherwise -> (# s2, (I# tid#, ref) #)
+        | isTrue# (rawSlot# ==# Exts.negateInt# 1#) -> slow s1
         | otherwise ->
             let slot# = Exts.negateInt# rawSlot# Exts.-# 2#
-                IO slow = ensureRefReattach tsm tableRef _cap keys# vals# (I# slot#) (I# tid#) def
-            in slow s1
+                IO reattach = ensureRefReattach tsm tableRef _cap keys# vals# (I# slot#) (I# tid#) def
+            in reattach s1
+        where
+          IO slow = do
+            tid <- myThreadId
+            ref <- insertNew tsm tid (I# tid#) def
+            pure (I# tid#, ref)
 {-# INLINE ensureRefFast #-}
 
 
@@ -875,7 +916,7 @@ ensureRefReattach tsm tableRef origCap keys# vals# slot tidKey def = do
   newRef <- newIORef def
   writeVal vals# slot newRef
   writeKey keys# slot tidKey
-  Table cap' _ _ <- readIORef tableRef
+  Table cap' _ _ _ <- readIORef tableRef
   when (cap' /= origCap) $ propagateRef tsm tidKey newRef
   pure (tidKey, newRef)
 {-# NOINLINE ensureRefReattach #-}
@@ -897,14 +938,16 @@ ensureRefReattach tsm tableRef origCap keys# vals# slot tidKey def = do
 -- @
 lookupRefFast :: ThreadStorageMap a -> IO (Int, Maybe (IORef a))
 lookupRefFast (ThreadStorageMap tableRef _) = do
-  Table _cap keys# vals# <- readIORef tableRef
+  Table _cap keys# vals# dead <- readIORef tableRef
   IO $ \s0 ->
     let !(I# mask#) = _cap - 1
     in case stg_probeThreadSlot# keys# mask# s0 of
       (# s1, tid#, slot# #)
         | isTrue# (slot# >=# 0#) ->
             case Exts.readArray# vals# slot# s1 of
-              (# s2, ref #) -> (# s2, (I# tid#, Just ref) #)
+              (# s2, ref #)
+                | isDead dead ref -> (# s2, (I# tid#, Nothing) #)
+                | otherwise -> (# s2, (I# tid#, Just ref) #)
         | otherwise -> (# s1, (I# tid#, Nothing) #)
 {-# INLINE lookupRefFast #-}
 
@@ -915,13 +958,13 @@ lookupRefFast (ThreadStorageMap tableRef _) = do
 -- current thread's TSO (e.g. inspecting another thread's slot).
 lookupRef :: ThreadStorageMap a -> Int -> IO (Maybe (IORef a))
 lookupRef (ThreadStorageMap tableRef _) !tidKey = do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   result <- probeFind keys# vals# cap (slotFor cap tidKey) tidKey
   case result of
     Nothing -> Nothing <$ pure ()
     Just (slot, ref) -> do
       k <- readKey keys# slot
-      pure $! if k .&. detachedBit /= 0 then Nothing else Just ref
+      pure $! if k .&. detachedBit /= 0 || isDead dead ref then Nothing else Just ref
 {-# INLINE lookupRef #-}
 
 
@@ -956,19 +999,19 @@ insertNew :: ThreadStorageMap a -> ThreadId -> Int -> a -> IO (IORef a)
 insertNew tsm@(ThreadStorageMap tableRef resizeLock) tid !tidKey val = do
   ref <- newIORef val
   let go = do
-        Table cap keys# vals# <- readIORef tableRef
+        Table cap keys# vals# _ <- readIORef tableRef
         let !home = slotFor cap tidKey
         success <- claimSlot keys# vals# cap home tidKey ref
         if success
           then ensureCurrent
           else do
             withMVar resizeLock $ \_ -> do
-              Table curCap _ _ <- readIORef tableRef
+              Table curCap _ _ _ <- readIORef tableRef
               when (curCap == cap) $ growTable tableRef cap
             go
 
       ensureCurrent = do
-        Table cap keys# vals# <- readIORef tableRef
+        Table cap keys# vals# _ <- readIORef tableRef
         let !home = slotFor cap tidKey
         found <- probeFind keys# vals# cap home tidKey
         case found of
@@ -1024,8 +1067,8 @@ claimSlot keys# vals# cap home key ref = go home 0
 -- state survives resize.  Home slot computed from the raw thread ID.
 rehashTable :: IORef (Table a) -> Int -> Int -> IO ()
 rehashTable tableRef !oldCap !newCap = do
-  Table _ oldKeys# oldVals# <- readIORef tableRef
-  newTable@(Table _ newKeys# newVals#) <- allocateTable newCap
+  Table _ oldKeys# oldVals# dead <- readIORef tableRef
+  newTable@(Table _ newKeys# newVals# _) <- allocateTable dead newCap
   let copyLoop !i
         | i >= oldCap = pure ()
         | otherwise = do
@@ -1033,7 +1076,7 @@ rehashTable tableRef !oldCap !newCap = do
             if k /= emptySlot && k /= tombstone
               then do
                 oldRef <- readVal oldVals# i
-                if isSentinel oldRef
+                if isDead dead oldRef
                   then do
                     yield
                     copyLoop i
@@ -1057,15 +1100,15 @@ growTable tableRef !oldCap = rehashTable tableRef oldCap (oldCap * 2)
 -- Retries if a resize occurred between the probe and the tombstone.
 removeEntry :: ThreadStorageMap a -> Int -> IO ()
 removeEntry tsm@(ThreadStorageMap tableRef _) !tidKey = do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   let !home = slotFor cap tidKey
   result <- probeFind keys# vals# cap home tidKey
   case result of
     Nothing -> pure ()
     Just (!slot, _) -> do
-      writeVal vals# slot toSentinel
+      writeVal vals# slot dead
       writeKey keys# slot tombstone
-      Table cap' _ _ <- readIORef tableRef
+      Table cap' _ _ _ <- readIORef tableRef
       when (cap' /= cap) $ removeEntry tsm tidKey
 
 
@@ -1080,22 +1123,22 @@ removeEntry tsm@(ThreadStorageMap tableRef _) !tidKey = do
 -- concurrent mutations may or may not be reflected.
 storedItems :: ThreadStorageMap a -> IO [(Int, a)]
 storedItems (ThreadStorageMap tableRef _) = do
-  Table cap keys# vals# <- readIORef tableRef
-  go keys# vals# cap 0 []
+  Table cap keys# vals# dead <- readIORef tableRef
+  go keys# vals# dead cap 0 []
   where
-    go keys# vals# cap !i !acc
+    go keys# vals# dead cap !i !acc
       | i >= cap = pure (reverse acc)
       | otherwise = do
           k <- readKey keys# i
           if k /= emptySlot && k /= tombstone && k .&. detachedBit == 0
             then do
               ref <- readVal vals# i
-              if isSentinel ref
-                then go keys# vals# cap (i + 1) acc
+              if isDead dead ref
+                then go keys# vals# dead cap (i + 1) acc
                 else do
                   v <- readIORef ref
-                  go keys# vals# cap (i + 1) ((k, v) : acc)
-            else go keys# vals# cap (i + 1) acc
+                  go keys# vals# dead cap (i + 1) ((k, v) : acc)
+            else go keys# vals# dead cap (i + 1) acc
 
 
 ---------------------------------------------------------------------------
@@ -1225,7 +1268,7 @@ foreign import ccall unsafe "purge_find_dead"
 {-# SPECIALIZE purgeDeadThreads :: ThreadStorageMap a -> IO () #-}
 purgeDeadThreads :: (MonadIO m) => ThreadStorageMap a -> m ()
 purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
-  Table cap keys# vals# <- readIORef tableRef
+  Table cap keys# vals# dead <- readIORef tableRef
   tids <- listThreads
   (MutIntArray liveArr#, nLive) <- buildLiveSet tids
   deadArr@(MutIntArray deadArr#) <- newMutIntArray (cap + 1)
@@ -1234,7 +1277,7 @@ purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
         | i > deadCount = pure ()
         | otherwise = do
             slot <- readMutInt deadArr i
-            writeVal vals# slot toSentinel
+            writeVal vals# slot dead
             writeKey keys# slot tombstone
             tomb (i + 1)
   tomb 1
@@ -1244,7 +1287,7 @@ purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
       !targetCap = nextPow2 (max minCap (liveInTable * 4))
   when (targetCap < cap) $
     withMVar resizeLock $ \_ -> do
-      Table curCap _ _ <- readIORef tableRef
+      Table curCap _ _ _ <- readIORef tableRef
       when (curCap == cap) $
         rehashTable tableRef cap targetCap
 #endif

@@ -2,6 +2,14 @@
 
 ## 0.4.2.0
 
+- Fix a memory-safety bug: a probe that matched a key while its slot was
+  being tombstoned could dereference the shared empty-slot sentinel
+  as an `IORef a`, yielding garbage values or writing the given value into the
+  sentinel reference shared by every map in the running process.
+- The dead-slot placeholder is now allocated upon construction of the map as an
+  error call of the map's element type, so unsafe access is well-typed (panics)
+  instead of being a failed `unsafeCoerce#`; identity is tested `sameMutVar#`
+  via `IORef`'s `Eq` instance now, instead of `reallyUnsafePtrEquality#`.
 - Add pure-C coverage for the purge scan.
 
 ## 0.4.1.1
