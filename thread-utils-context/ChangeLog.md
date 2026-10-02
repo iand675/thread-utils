@@ -65,6 +65,22 @@
 - Add regression tests for lost writes during rehash, IDs past 2^32,
   values released at GC for finished threads and dropped maps, the stable
   per-entry `IORef`, and purge contention.
+- Mask asynchronous exceptions across a slot claim and across a rehash. A
+  thread killed (`killThread`, `timeout`) between claiming a slot and
+  publishing it left the slot claiming forever, and the next rehash spun
+  on it under the lock with every writer blocked behind it. A thread
+  killed during a rehash left the table frozen with no new table to come,
+  and every later writer looped on it without a safepoint, which stalled
+  every GC in the process. A writer that finds a frozen table with no
+  rehash in progress now finishes the rehash itself.
+- Rehash kills the cells of the entries it drops, as `purgeDeadThreads`
+  does. A finished thread's cell is otherwise kept by the RTS for as long
+  as a `ThreadId` for the thread is held, with its value and no slot left
+  through which to release it.
+- `lookupRaw`, `updateRaw`, `ensureRef` and `lookupRef` reject a thread ID
+  of 0 or one with bits above the 60 a key holds, which name no thread.
+  Inserting under 0 published a live cell in a slot every probe and the
+  rehash treated as empty.
 
 ## 0.4.1.1
 
