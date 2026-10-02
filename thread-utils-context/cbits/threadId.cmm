@@ -11,13 +11,13 @@
 //     reclaims it.
 //
 //   CLAIMING (bit 62): set by a writer between CAS-ing the key and
-//     publishing it (see claimAndPublish in Storage.hs). A probe for a
-//     thread whose claim is in flight waits for it to finish. The window
-//     is straight-line code with no safepoint, so it is short.
+//     publishing it (see claimAndPublish in Storage.hs). A slot is only
+//     claimed from a state with no attached value, so a probe reads a
+//     claim in flight as a miss (see PROBE_BODY).
 //
 //   DETACHED (bit 61): set when the user detaches a context, cleared on
-//     re-attach. The probes encode it in their return value so the
-//     Haskell side never touches the cell array for detached slots.
+//     re-attach. The probes encode it in their return value, along with
+//     the entry's MutVar#, so re-attaching needs no further cell read.
 //
 //   FROZEN (bit 60): set on every slot of a table that is being rehashed.
 //     No writer CASes from a frozen word, so a frozen table never changes
@@ -142,7 +142,7 @@ stg_readSlot(P_ keys, P_ cells, W_ slot)
 // tuples.
 //
 //   attached, cell alive -> RETURN_FOUND(slot, key, var), var the MutVar#
-//   detached             -> RETURN_DETACHED(slot, key)
+//   detached, cell alive -> RETURN_DETACHED(slot, key, var)
 //   absent, mid-claim, or the thread's cell is dead -> RETURN_MISS
 //
 // A slot is only ever claimed from a state with no attached value (empty,
@@ -159,6 +159,9 @@ stg_readSlot(P_ keys, P_ cells, W_ slot)
 // finalized, which only happens to a cell after its key is tombstoned (or
 // to a map's cells once the map itself is unreachable), so it takes the
 // same path.
+//
+// The likely annotations lay out an attached hit on the home slot as the
+// fall-through path.
 // -----------------------------------------------------------------------
 
 #define PROBE_BODY                                                         \
@@ -166,30 +169,39 @@ stg_readSlot(P_ keys, P_ cells, W_ slot)
     slot = home;                                                           \
   again:                                                                   \
     (key) = prim %load_acquire64(KEY_ADDR(keys, slot));                    \
-    if ((key & KEY_MASK) == tid) {                                         \
-        if ((key & (CLAIMING_BIT | DETACHED_BIT)) != 0) {                  \
+    if ((key & KEY_MASK) == tid) (likely: True) {                          \
+        if ((key & (CLAIMING_BIT | DETACHED_BIT)) != 0) (likely: False) {  \
             if ((key & CLAIMING_BIT) != 0) {                               \
                 RETURN_MISS;                                               \
             }                                                              \
-            RETURN_DETACHED(slot, key);                                    \
+            cell = P_[CELL_ADDR(cells, slot)];                             \
+            info = GET_INFO_ACQUIRE(cell);                                 \
+            if (info == stg_WEAK_info) {                                   \
+                var = StgWeak_value(cell);                                 \
+                updateRemembSetPushPtr(var);                               \
+                RETURN_DETACHED(slot, key, var);                           \
+            }                                                              \
+            goto dead;                                                     \
         }                                                                  \
         cell = P_[CELL_ADDR(cells, slot)];                                 \
         info = GET_INFO_ACQUIRE(cell);                                     \
-        if (info == stg_WEAK_info) {                                       \
+        if (info == stg_WEAK_info) (likely: True) {                        \
             var = StgWeak_value(cell);                                     \
             updateRemembSetPushPtr(var);                                   \
             RETURN_FOUND(slot, key, var);                                  \
         }                                                                  \
-        if (W_[KEY_ADDR(keys, slot)] != key) {                             \
-            goto again;                                                    \
-        }                                                                  \
-        RETURN_MISS;                                                       \
+        goto dead;                                                         \
     }                                                                      \
     if (key == 0 || key == FROZEN_BIT) {                                   \
         RETURN_MISS;                                                       \
     }                                                                      \
     slot = (slot + 1) & mask;                                              \
     if (slot != home) {                                                    \
+        goto again;                                                        \
+    }                                                                      \
+    RETURN_MISS;                                                           \
+  dead:                                                                    \
+    if (W_[KEY_ADDR(keys, slot)] != key) {                                 \
         goto again;                                                        \
     }                                                                      \
     RETURN_MISS;
@@ -212,7 +224,8 @@ stg_readSlot(P_ keys, P_ cells, W_ slot)
 //                  there and var the MutVar# behind its live cell
 //   slot == -1  -> no live entry; key is 0, var a placeholder (keys)
 //   slot <= -2  -> entry found but detached; real index = -(slot+2);
-//                  key is the observed word, var a placeholder (keys)
+//                  key is the observed word and var the MutVar# behind
+//                  its live cell
 // -----------------------------------------------------------------------
 
 stg_probeThreadSlot(P_ keys, P_ cells, W_ mask)
@@ -223,7 +236,7 @@ stg_probeThreadSlot(P_ keys, P_ cells, W_ mask)
     tid = TO_W_(StgTSO_id(CurrentTSO)) & KEY_MASK;
 
 #define RETURN_FOUND(s, k, v)  return (tid, s, k, v)
-#define RETURN_DETACHED(s, k)  return (tid, 0 - (s) - 2, k, keys)
+#define RETURN_DETACHED(s, k, v)  return (tid, 0 - (s) - 2, k, v)
 #define RETURN_MISS            return (tid, -1, 0, keys)
     PROBE_BODY
 #undef RETURN_FOUND
@@ -247,7 +260,7 @@ stg_probeSlotByKey(P_ keys, P_ cells, W_ mask, W_ tid)
     P_ cell, var;
 
 #define RETURN_FOUND(s, k, v)  return (s, k, v)
-#define RETURN_DETACHED(s, k)  return (0 - (s) - 2, k, keys)
+#define RETURN_DETACHED(s, k, v)  return (0 - (s) - 2, k, v)
 #define RETURN_MISS            return (-1, 0, keys)
     PROBE_BODY
 #undef RETURN_FOUND

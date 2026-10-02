@@ -3,6 +3,7 @@
 {-# LANGUAGE GHCForeignImportPrim #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE UnboxedSums #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 
@@ -277,9 +278,9 @@ foreign import prim "stg_readSlot"
 -- | Probe for the current thread. Returns @(tid, slot, key, var)@: @tid@
 -- is the current thread's key (see 'toKey'), @key@ is the key word
 -- observed at the matching slot (callers CAS against it), and @var@ is
--- only meaningful when @slot >= 0@ (attached with a live cell), being the
--- entry's 'MutVar#'. A slot mid-claim reads as a miss (see the CMM
--- source); the probe never waits.
+-- the entry's 'MutVar#' when an entry was found (@slot >= 0@ attached,
+-- @slot <= -2@ detached), its cell being alive. A slot mid-claim reads as
+-- a miss (see the CMM source); the probe never waits.
 foreign import prim "stg_probeThreadSlot"
   probeThreadSlot#
     :: Exts.MutableByteArray# RealWorld
@@ -358,17 +359,18 @@ probeSlotByKey# keys# cells# mask# tid# s0 = go home s0
           | k .&. keyMask == tid ->
               if k .&. claimingBit /= 0
                 then miss s1
-                else if k .&. detachedBit /= 0
-                  then let !(I# r#) = negate slot - 2 in (# s1, r#, k#, placeholder #)
-                  else let !(I# i#) = slot in case Exts.readArray# cells# i# s1 of
-                    (# s2, cell #) -> case Exts.deRefWeak# cell s2 of
-                      (# s3, alive#, var #)
-                        | isTrue# (alive# ==# 1#) -> (# s3, i#, k#, var #)
-                        | otherwise -> case readKey keys# slot of
-                            IO again -> case again s3 of
-                              (# s4, k' #)
-                                | k' /= k -> go slot s4
-                                | otherwise -> miss s4
+                else let !(I# i#) = slot in case Exts.readArray# cells# i# s1 of
+                  (# s2, cell #) -> case Exts.deRefWeak# cell s2 of
+                    (# s3, alive#, var #)
+                      | isTrue# (alive# ==# 1#) ->
+                          if k .&. detachedBit /= 0
+                            then let !(I# r#) = negate slot - 2 in (# s3, r#, k#, var #)
+                            else (# s3, i#, k#, var #)
+                      | otherwise -> case readKey keys# slot of
+                          IO again -> case again s3 of
+                            (# s4, k' #)
+                              | k' /= k -> go slot s4
+                              | otherwise -> miss s4
           | k == emptySlot || k == frozenBit -> miss s1
           | otherwise ->
               let !next = (slot + 1) .&. mask
@@ -682,25 +684,27 @@ readSlot keys# cells# (I# i#) = IO $ \s ->
 
 
 -- | Linear probe that masks the flag bits when comparing keys, waiting out
--- an in-flight claim on @key@'s slot the same way the CMM probes do.
+-- an in-flight claim on @key@'s slot.
 --
--- Returns the slot, the key word /as observed/ (callers CAS against it),
--- and the cell read with that key, which may be dead.
-probeFind :: Exts.MutableByteArray# RealWorld -> Exts.MutableArray# RealWorld (Cell a) -> Int -> Key -> IO (Maybe (Int, Key, CellRef a))
-probeFind keys# cells# cap key = go (slotFor cap key) 0
+-- Returns the slot and the key word /as observed/ (callers CAS against
+-- it), as an unboxed sum so a hit allocates nothing.
+probeFind
+  :: Exts.MutableByteArray# RealWorld -> Int -> Key
+  -> Exts.State# RealWorld -> (# Exts.State# RealWorld, (# (# #) | (# Int#, Int64# #) #) #)
+probeFind keys# cap key = go (slotFor cap key) 0
   where
     !mask = cap - 1
-    go !slot !steps
-      | steps >= cap = pure Nothing
-      | otherwise = do
-          (k, cell) <- readSlot keys# cells# slot
-          if (k .&. keyMask) == key
-            then if k .&. claimingBit /= 0
-              then yield >> go slot steps
-              else pure $! Just (slot, k, cell)
-            else if k == emptySlot || k == frozenBit
-              then pure Nothing
-              else go ((slot + 1) .&. mask) (steps + 1)
+    go !slot !steps s0
+      | steps >= cap = (# s0, (# (# #) | #) #)
+      | otherwise = case readKey keys# slot of
+          IO readIt -> case readIt s0 of
+            (# s1, k@(I64# k#) #)
+              | (k .&. keyMask) == key ->
+                  if k .&. claimingBit /= 0
+                    then go slot steps (Exts.yield# s1)
+                    else let !(I# i#) = slot in (# s1, (# | (# i#, k# #) #) #)
+              | k == emptySlot || k == frozenBit -> (# s1, (# (# #) | #) #)
+              | otherwise -> go ((slot + 1) .&. mask) (steps + 1) s1
 {-# INLINE probeFind #-}
 
 
@@ -1097,11 +1101,17 @@ ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
 {-# INLINE ensureRefFast #-}
 
 
+-- | Cold path of 'ensureRefFast': re-attach a detached entry in place
+-- ('reattachDetached'), or insert through 'setEntry'.
 ensureCurrent :: ThreadStorageMap a -> Key -> a -> IO (Int, IORef a)
-ensureCurrent tsm tidKey def = do
-  tid <- myThreadId
-  ref <- setEntry False tsm tid tidKey def
-  pure (keyInt tidKey, ref)
+ensureCurrent tsm tidKey def = IO $ \s0 -> case reattachDetached tsm tidKey def s0 of
+  (# s1, (# | var #) #) -> (# s1, (keyInt tidKey, toRef var) #)
+  (# s1, (# (# #) | #) #) ->
+    let insert = do
+          tid <- myThreadId
+          ref <- setEntry False tsm tid tidKey def
+          pure (keyInt tidKey, ref)
+    in case insert of IO k -> k s1
 {-# NOINLINE ensureCurrent #-}
 
 
@@ -1175,36 +1185,47 @@ modifyRef = modifyIORef'
 -- Internal: writes
 ---------------------------------------------------------------------------
 
--- | Cold path of 'update': attach a value for the current thread.
+-- | Re-attach the calling thread's detached entry in place, if it has one.
 --
--- A detached entry is re-attached in place: probe again (cheaper than
--- keeping the first probe's slot live through 'update's hot path), then
--- write into the entry's 'MutVar#' under a claim of its slot, the same
--- step 'placeIn' takes, with no 'ThreadId' and no cell. Anything else (a
--- miss, a changed slot, a dead cell, a rehash) goes to 'setEntry', which
--- needs the 'ThreadId' to key a new cell.
+-- Probes again (cheaper than keeping the first probe's answer live through
+-- the callers' hot paths). The probe returns a detached entry's 'MutVar#'
+-- along with its slot, so this is a claim of that slot and a write into
+-- the 'MutVar#', the same step 'placeIn' takes, with no cell read, no
+-- 'ThreadId' and no allocation. Returns the entry's 'MutVar#', or nothing
+-- if there is no detached entry or the claim lost a race (the slot
+-- changed, or its table is being rehashed); callers then go to
+-- 'setEntry'. The result is an unboxed sum, so it allocates nothing.
+reattachDetached
+  :: ThreadStorageMap a -> Key -> a
+  -> Exts.State# RealWorld -> (# Exts.State# RealWorld, (# (# #) | MutVar# RealWorld a #) #)
+reattachDetached (ThreadStorageMap tableRef _) tidKey@(I64# tidKey#) new s0 =
+  case readIORef tableRef of
+    IO readTable -> case readTable s0 of
+      (# s, Table cap keys# cells# _ #) ->
+        let !(I# mask#) = cap - 1
+        in case probeSlotByKey# keys# cells# mask# tidKey# s of
+          (# s1, slot#, key#, var #)
+            | isTrue# (slot# Exts.<=# -2#) ->
+                let write = writeVar var new >> pure True
+                in case claimAndPublish keys# (negate (I# slot#) - 2) (I64# key#) tidKey write of
+                  IO claim -> case claim s1 of
+                    (# s2, Wrote #) -> (# s2, (# | var #) #)
+                    (# s2, _ #) -> (# s2, (# (# #) | #) #)
+            | otherwise -> (# s1, (# (# #) | #) #)
+{-# INLINE reattachDetached #-}
+
+
+-- | Cold path of 'update': attach a value for the current thread, by
+-- re-attaching a detached entry in place ('reattachDetached') or through
+-- 'setEntry', which needs the 'ThreadId' to key a new cell.
 setCurrent :: ThreadStorageMap a -> Key -> a -> IO ()
-setCurrent tsm@(ThreadStorageMap tableRef _) tidKey@(I64# tidKey#) new = do
-  Table cap keys# cells# _ <- readIORef tableRef
-  let !(I# mask#) = cap - 1
-  probed <- IO $ \s -> case probeSlotByKey# keys# cells# mask# tidKey# s of
-    (# s', slot#, key#, _ #) -> (# s', (I# slot#, I64# key#) #)
-  done <- case probed of
-    (slot, observed) | slot <= -2 -> do
-      let !i = negate slot - 2
-      CellRef cell <- readCellRef cells# i
-      existing <- cellVar cell
-      case existing of
-        Just (IORef (STRef var)) -> do
-          claim <- claimAndPublish keys# i observed tidKey (writeVar var new >> pure True)
-          pure $! case claim of
-            Wrote -> True
-            _ -> False
-        Nothing -> pure False
-    _ -> pure False
-  when (not done) $ do
-    tid <- myThreadId
-    void $ setEntry True tsm tid tidKey new
+setCurrent tsm tidKey new = IO $ \s0 -> case reattachDetached tsm tidKey new s0 of
+  (# s1, (# | _ #) #) -> (# s1, () #)
+  (# s1, (# (# #) | #) #) ->
+    let insert = do
+          tid <- myThreadId
+          void $ setEntry True tsm tid tidKey new
+    in case insert of IO k -> k s1
 {-# NOINLINE setCurrent #-}
 
 
@@ -1221,16 +1242,18 @@ detachAt tsm keys# slot observed tidKey = do
 -- | Mark @key@'s entry detached in the current table, if it is attached.
 detachKey :: ThreadStorageMap a -> Key -> IO ()
 detachKey tsm@(ThreadStorageMap tableRef _) key = do
-  Table cap keys# cells# _ <- readIORef tableRef
-  found <- probeFind keys# cells# cap key
-  case found of
-    Nothing -> pure ()
-    Just (slot, k, _)
-      | k .&. frozenBit /= 0 -> awaitRehash tsm >> detachKey tsm key
-      | k .&. detachedBit /= 0 -> pure ()
-      | otherwise -> do
-          ok <- casLive keys# slot k (k .|. detachedBit)
-          when (not ok) $ detachKey tsm key
+  Table cap keys# _ _ <- readIORef tableRef
+  IO $ \s0 -> case probeFind keys# cap key s0 of
+    (# s1, (# (# #) | #) #) -> (# s1, () #)
+    (# s1, (# | (# i#, k# #) #) #) ->
+      let !k = I64# k#
+          next
+            | k .&. frozenBit /= 0 = awaitRehash tsm >> detachKey tsm key
+            | k .&. detachedBit /= 0 = pure ()
+            | otherwise = do
+                ok <- casLive keys# (I# i#) k (k .|. detachedBit)
+                when (not ok) $ detachKey tsm key
+      in case next of IO n -> n s1
 
 
 -- | Where 'placeIn' left a value.
