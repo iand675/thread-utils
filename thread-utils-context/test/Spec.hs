@@ -6,10 +6,11 @@ import System.Mem
 import Control.Concurrent
 import Control.Concurrent.MVar
 import Control.Concurrent.Thread.Storage
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (ErrorCall, SomeException, evaluate, try)
 import Control.Monad
 import Data.IORef
 import Data.List hiding (lookup)
+import GHC.Conc (ThreadStatus (..), threadStatus)
 import GHC.Stats (getRTSStatsEnabled, getRTSStats, gc, gcdetails_live_bytes)
 import System.Timeout (timeout)
 import System.Mem.Weak (Weak, deRefWeak)
@@ -298,6 +299,86 @@ main = hspec $ do
         v <- readIORef before
         putMVar result (before == after, v)
       takeMVar result `shouldReturn` (True, 2)
+
+    -- The RTS keeps a weak pointer for as long as its key lives, and a
+    -- finished thread's TSO lives for as long as a ThreadId for it is
+    -- held. A rehash that dropped the thread's slot without killing its
+    -- cell would therefore keep the value until the ThreadId was dropped,
+    -- with no slot left for purgeDeadThreads to find.
+    it "releases a finished thread's value at the next rehash while its ThreadId is still held" $ do
+      tsm <- newThreadStorageMapWith 16
+      collected <- newEmptyMVar
+      done <- newEmptyMVar
+      holder <- newIORef Nothing
+      tid <- forkIO $ do
+        payload <- newIORef ()
+        _ <- mkWeakIORef payload (putMVar collected ())
+        _ <- attach tsm payload
+        putMVar done ()
+      writeIORef holder (Just tid)
+      takeMVar done
+      spinUntil $ (== ThreadFinished) <$> threadStatus tid
+      -- Fill the table past its load limit under the main thread's name so
+      -- it rehashes, dropping the finished thread's slot.
+      me <- myThreadId
+      dummy <- newIORef ()
+      forM_ [1 .. 200 :: Int] $ \i ->
+        updateRaw tsm me (0x40000000 + fromIntegral i) (\_ -> (Just dummy, ()))
+      released <- awaitCollected collected
+      stillHeld <- readIORef holder
+      (released, fmap (const ()) stillHeld) `shouldBe` (True, Just ())
+
+  describe "raw API" $ do
+    it "rejects thread ID 0, which is the empty-slot word" $ do
+      tsm <- newThreadStorageMapWith 16
+      me <- myThreadId
+      r <- try (updateRaw tsm me 0 (\_ -> (Just (1 :: Int), ())))
+      case r of
+        Left (_ :: ErrorCall) -> pure ()
+        Right () -> expectationFailure "updateRaw accepted thread ID 0"
+      r2 <- try (lookupRaw tsm 0 :: IO (Maybe Int))
+      case r2 of
+        Left (_ :: ErrorCall) -> pure ()
+        Right _ -> expectationFailure "lookupRaw accepted thread ID 0"
+
+  -- A thread killed between claiming a slot and publishing it, or in the
+  -- middle of a rehash, must not leave the map in a state no writer can
+  -- get past. Victims attach and detach in a loop while being killed and
+  -- respawned; a churner forces rehashes and purges throughout. Afterwards
+  -- a fresh thread must still be able to attach. A slot stuck claiming
+  -- makes the next rehash spin under the lock, and a table left frozen
+  -- makes every writer loop; either shows up here as a timeout.
+  describe "asynchronous exceptions" $ do
+    it "leave the map writable after threads are killed mid-write" $ do
+      tsm <- newThreadStorageMapWith 16
+      me <- myThreadId
+      stop <- newIORef False
+      churnDone <- newEmptyMVar
+      _ <- forkIO $ do
+        let churn !n = do
+              s <- readIORef stop
+              unless s $ do
+                forM_ [1 .. 32 :: Int] $ \j ->
+                  updateRaw tsm me (0x40000000 + fromIntegral (n * 32 + j)) (\_ -> (Just (0 :: Int), ()))
+                purgeDeadThreads tsm
+                churn (n + 1)
+        churn (0 :: Int)
+        putMVar churnDone ()
+      let victim = forever $ do
+            _ <- attach tsm (1 :: Int)
+            _ <- detach tsm
+            _ <- ensureRefFast tsm 2
+            pure ()
+      replicateM_ 2_000 $ do
+        tids <- replicateM 8 (forkIO victim)
+        yield
+        mapM_ killThread tids
+      writeIORef stop True
+      churned <- timeout 10_000_000 (takeMVar churnDone)
+      final <- newEmptyMVar
+      _ <- forkIO $ attach tsm (3 :: Int) >> lookup tsm >>= putMVar final
+      attached <- timeout 10_000_000 (takeMVar final)
+      (churned, attached) `shouldBe` (Just (), Just (Just 3))
 
   describe "rehash" $ do
     -- Each writer only touches its own entry, so it must always read back

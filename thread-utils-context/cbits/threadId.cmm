@@ -74,7 +74,6 @@ stg_getCurrentThreadId()
 
 
 import CLOSURE stg_WEAK_info;
-import CLOSURE stg_WHITEHOLE_info;
 
 // -----------------------------------------------------------------------
 // stg_cellOwner
