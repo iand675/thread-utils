@@ -15,24 +15,30 @@
   now releases the values it holds for threads that outlive it. A map's
   overhead per parked thread drops from about 146 to about 90 bytes.
 - Every change to a slot's value cell or attached state is bracketed by a
-  CAS of the key into a transient "claiming" state. A slot is only claimed
-  from a state with no attached value, so a probe that meets a claim reads
-  it as a miss and never waits; a second writer waits (with a yield)
-  rather than claiming over it. Tombstoning is a CAS from the observed key,
-  then a CAS of the cell, so a tombstone never lands on a slot that has
-  since changed.
+  CAS of the key into a transient "claiming" state and a store of the
+  published key. A slot is only claimed from a state with no attached
+  value, so a probe that meets a claim reads it as a miss and never waits;
+  a second writer waits (with a yield) rather than claiming over it.
+  `detach` and tombstoning are CASes from the observed key (a tombstone is
+  then followed by a CAS of the cell), so neither lands on a slot that has
+  since changed. Previously `detach` and re-attach were unconditional
+  stores, which could overwrite a concurrent writer's key.
 - A tombstoned slot is no longer reused by another thread in place. Inserts
   stop at three quarters of the slots, tombstones included, and the table is
-  then rehashed (at the same capacity when fewer than half the slots are
-  live). Since a slot's thread ID never changes within a table, probes read
-  the key once (with acquire semantics) and then the cell, with no retry
-  loop.
+  then rehashed. It doubles when at least half the slots hold running
+  threads; otherwise (thread churn) it doubles up to 1024 slots and then
+  keeps its size. Since a slot's thread ID never changes within a table,
+  probes read the key once (with acquire semantics) and then the cell, with
+  no retry loop.
 - Rehash freezes every slot of the old table before copying it (a fourth
   flag bit that no writer will CAS from), and writers that meet a frozen
-  slot wait for the new table. This replaces the copy's second pass and
-  the propagation of detach and re-attach to a newer table, which could
-  lose a write made during a rehash or bring back an entry removed after
-  one. Rehashes also drop dead threads' slots.
+  slot wait for the new table, all woken at once. This replaces the copy's
+  second pass and the propagation of detach and re-attach to a newer
+  table, which could lose a write made during a rehash or bring back an
+  entry removed after one. Rehashes copy only entries whose thread is
+  still running, so a finished thread's entry goes at the next rehash even
+  if its `ThreadId` is still referenced, as it already did under
+  `purgeDeadThreads`.
 - Store thread IDs in full. GHC's thread IDs are 64-bit, but keys kept only
   their low 32 bits, so after 2^32 forks a thread stopped finding its own
   entry and could be mistaken for a detached entry of the older thread
@@ -45,7 +51,8 @@
   `ThreadId`-taking functions use the full ID.
 - An entry keeps one `IORef` for its thread's whole life in the map:
   `detach` leaves it in place and a later `attach` or `ensureRefFast`
-  writes into it, where it used to allocate a new one.
+  writes into it, where it used to allocate a new one. Re-attaching
+  allocates nothing.
 - `purgeDeadThreads` checks each entry against its own thread, read
   through the entry's cell, instead of a `listThreads` snapshot. It no
   longer evicts live threads under the non-moving collector (whose heap

@@ -105,7 +105,10 @@
 --   into the same 'IORef' and allocates nothing.
 -- * Once a thread's TSO is unreachable, the GC drops the value. The slot is
 --   reclaimed at the next rehash (which an insert into a full table
---   triggers) or by 'purgeDeadThreads'.
+--   triggers) or by 'purgeDeadThreads'. Both also drop the entry of a
+--   thread that has finished but whose 'ThreadId' is still referenced, so
+--   the @…OnThread@ functions stop finding a finished thread's value at
+--   some point after it finishes.
 -- * When a 'ThreadStorageMap' itself becomes unreachable, a finalizer
 --   releases the values it still holds for threads that are alive.
 --
@@ -169,7 +172,7 @@ module Control.Concurrent.Thread.Storage (
   purgeDeadThreads,
 ) where
 
-import Control.Concurrent (MVar, ThreadId, myThreadId, newMVar, withMVar, yield)
+import Control.Concurrent (MVar, ThreadId, myThreadId, newMVar, readMVar, withMVar, yield)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Bits (complement, countLeadingZeros, finiteBitSize, unsafeShiftL, (.&.), (.|.))
@@ -573,9 +576,11 @@ tableMoved tableRef keys# = do
 
 -- | Wait for the rehash that froze a slot we tried to write. The rehasher
 -- holds the lock from its first freeze until the new table is published,
--- so once we hold it the current table is the new one.
+-- so once the lock is full again the current table is the new one.
+-- 'readMVar' wakes every waiter at once; taking the lock in turn would
+-- hand it from one blocked writer to the next.
 awaitRehash :: ThreadStorageMap a -> IO ()
-awaitRehash (ThreadStorageMap _ lock) = withMVar lock (\_ -> pure ())
+awaitRehash (ThreadStorageMap _ lock) = () <$ readMVar lock
 
 
 -- | Home slot for a key. Hashes the key's low word, matching the CMM probes.
@@ -623,6 +628,22 @@ writeKeyPrivate keys# (I# i#) (I64# v#) = IO $ \s ->
   case Exts.writeInt64Array# keys# i# v# s of
     s' -> (# s', () #)
 {-# INLINE writeKeyPrivate #-}
+
+
+-- | Release a slot this thread holds claimed, writing @new@. No other
+-- writer CASes from a claiming key (they wait, or skip the slot), so on
+-- 64-bit targets an atomic store does: it is ordered after the writes made
+-- under the claim, and saves a CAS. 32-bit targets have no 64-bit atomic
+-- store primop, so they CAS from the claimed word, which cannot fail.
+publishKey :: Exts.MutableByteArray# RealWorld -> Int -> Key -> Key -> IO ()
+#if !defined(PORTABLE_PROBES)
+publishKey keys# (I# i#) _claimed (I64# v#) = IO $ \s ->
+  case Exts.atomicWriteIntArray# keys# i# (Exts.int64ToInt# v#) s of
+    s' -> (# s', () #)
+#else
+publishKey keys# slot claimed new = void (casKey keys# slot claimed new)
+#endif
+{-# INLINE publishKey #-}
 
 
 -- | A cell in a box, for code that passes it around in 'IO'.
@@ -697,8 +718,8 @@ probeFind keys# cells# cap key = go (slotFor cap key) 0
 -- before claiming (a claim and publish can restore the very same key
 -- word, so the key alone does not prove nothing changed).
 --
--- The publish is a second CAS, from the claiming state we own: nothing
--- else CASes from a claiming key, so it cannot fail, and it orders @write@
+-- The publish is a store over the claiming state we own ('publishKey'):
+-- nothing else CASes from a claiming key, and the store orders @write@
 -- before the key. It publishes @key@'s tid and detached bits if the write
 -- took effect, and restores @observed@ if it did not.
 claimAndPublish :: Exts.MutableByteArray# RealWorld -> Int -> Key -> Key -> IO Bool -> IO Claim
@@ -710,7 +731,7 @@ claimAndPublish keys# slot observed key write = do
     then pure NotClaimed
     else do
       wrote <- write
-      void $ casKey keys# slot claimed (if wrote then published else observed)
+      publishKey keys# slot claimed (if wrote then published else observed)
       pure $! if wrote then Wrote else Declined
 {-# INLINE claimAndPublish #-}
 
@@ -1154,12 +1175,36 @@ modifyRef = modifyIORef'
 -- Internal: writes
 ---------------------------------------------------------------------------
 
--- | Cold path of 'update': attach a value for the current thread, which
--- needs its 'ThreadId' to key a new cell.
+-- | Cold path of 'update': attach a value for the current thread.
+--
+-- A detached entry is re-attached in place: probe again (cheaper than
+-- keeping the first probe's slot live through 'update's hot path), then
+-- write into the entry's 'MutVar#' under a claim of its slot, the same
+-- step 'placeIn' takes, with no 'ThreadId' and no cell. Anything else (a
+-- miss, a changed slot, a dead cell, a rehash) goes to 'setEntry', which
+-- needs the 'ThreadId' to key a new cell.
 setCurrent :: ThreadStorageMap a -> Key -> a -> IO ()
-setCurrent tsm tidKey new = do
-  tid <- myThreadId
-  void $ setEntry True tsm tid tidKey new
+setCurrent tsm@(ThreadStorageMap tableRef _) tidKey@(I64# tidKey#) new = do
+  Table cap keys# cells# _ <- readIORef tableRef
+  let !(I# mask#) = cap - 1
+  probed <- IO $ \s -> case probeSlotByKey# keys# cells# mask# tidKey# s of
+    (# s', slot#, key#, _ #) -> (# s', (I# slot#, I64# key#) #)
+  done <- case probed of
+    (slot, observed) | slot <= -2 -> do
+      let !i = negate slot - 2
+      CellRef cell <- readCellRef cells# i
+      existing <- cellVar cell
+      case existing of
+        Just (IORef (STRef var)) -> do
+          claim <- claimAndPublish keys# i observed tidKey (writeVar var new >> pure True)
+          pure $! case claim of
+            Wrote -> True
+            _ -> False
+        Nothing -> pure False
+    _ -> pure False
+  when (not done) $ do
+    tid <- myThreadId
+    void $ setEntry True tsm tid tidKey new
 {-# NOINLINE setCurrent #-}
 
 
@@ -1192,6 +1237,7 @@ detachKey tsm@(ThreadStorageMap tableRef _) key = do
 data Placed a
   = PlacedFresh                -- ^ in the new cell we passed in
   | PlacedExisting (IORef a)   -- ^ in the entry's existing 'IORef'
+  | NeedCell                   -- ^ the slot needs a new cell, and we had none
   | TableFull
   | SlotFrozen
 
@@ -1202,28 +1248,44 @@ data Placed a
 -- With @overwrite = False@ an already attached entry is left as it is
 -- ('ensureRef'); with @True@ its value is replaced.
 --
--- The new cell is made up front because nothing may allocate inside a
--- claim. If the entry already has a live cell the new one is killed, so
--- the RTS does not keep it until the thread dies.
+-- Re-attaching and overwriting write into the entry's existing 'MutVar#',
+-- so the first attempt carries no cell. Only when a slot needs one (an
+-- insert, or a slot whose thread is gone) is a cell made, outside any
+-- claim since nothing may allocate inside one, and the placement retried.
+-- If the entry turns out to have a live cell by then, the new one is
+-- killed so the RTS does not keep it until the thread dies.
 setEntry :: Bool -> ThreadStorageMap a -> ThreadId -> Key -> a -> IO (IORef a)
-setEntry overwrite tsm@(ThreadStorageMap tableRef lock) tid key val = do
-  NewCell fresh freshVar <- newCell tid val
-  let go = do
-        Table cap keys# cells# _ <- readIORef tableRef
-        placed <- placeIn overwrite keys# cells# cap key val fresh
-        case placed of
-          PlacedFresh -> pure (toRef freshVar)
-          PlacedExisting ref -> killCell fresh >> pure ref
-          TableFull -> do
-            withMVar lock $ \_ -> do
-              moved <- tableMoved tableRef keys#
-              when (not moved) $ rehash tsm growCapacity
-            go
-          SlotFrozen -> awaitRehash tsm >> go
-  go
+setEntry overwrite tsm@(ThreadStorageMap tableRef lock) tid key val = withoutCell
+  where
+    withoutCell = do
+      Table cap keys# cells# dead <- readIORef tableRef
+      placed <- placeIn overwrite keys# cells# cap key val False dead
+      case placed of
+        PlacedExisting ref -> pure ref
+        NeedCell -> do
+          NewCell fresh freshVar <- newCell tid val
+          withCell fresh freshVar
+        PlacedFresh -> error "setEntry: placed a cell it was not given"
+        TableFull -> growFrom keys# >> withoutCell
+        SlotFrozen -> awaitRehash tsm >> withoutCell
+    withCell fresh freshVar = do
+      Table cap keys# cells# _ <- readIORef tableRef
+      placed <- placeIn overwrite keys# cells# cap key val True fresh
+      case placed of
+        PlacedFresh -> pure (toRef freshVar)
+        PlacedExisting ref -> killCell fresh >> pure ref
+        NeedCell -> error "setEntry: asked for a cell it was given"
+        TableFull -> growFrom keys# >> withCell fresh freshVar
+        SlotFrozen -> awaitRehash tsm >> withCell fresh freshVar
+    growFrom keys# =
+      withMVar lock $ \_ -> do
+        moved <- tableMoved tableRef keys#
+        when (not moved) $ rehash tsm growCapacity
 
 
--- | Linear-probe placement into one table. See 'setEntry'.
+-- | Linear-probe placement into one table. See 'setEntry'. @fresh@ is
+-- only used, and @haveFresh@ must only be set, when the caller made a new
+-- cell for this write.
 --
 -- Every slot change goes through 'claimAndPublish'. On a failed claim the
 -- same slot is re-read: the key changed under us, so there is always
@@ -1240,8 +1302,8 @@ placeIn
   :: Bool
   -> Exts.MutableByteArray# RealWorld
   -> Exts.MutableArray# RealWorld (Cell a)
-  -> Int -> Key -> a -> Cell a -> IO (Placed a)
-placeIn overwrite keys# cells# cap key val fresh = go (slotFor cap key) 0
+  -> Int -> Key -> a -> Bool -> Cell a -> IO (Placed a)
+placeIn overwrite keys# cells# cap key val haveFresh fresh = go (slotFor cap key) 0
   where
     !mask = cap - 1
     go !slot !steps
@@ -1255,11 +1317,13 @@ placeIn overwrite keys# cells# cap key val fresh = go (slotFor cap key) 0
                 used <- readUsed keys# cap
                 if used >= maxLoad cap
                   then pure TableFull
-                  else do
-                    claim <- claimAndPublish keys# slot k key (writeCell cells# slot fresh >> pure True)
-                    case claim of
-                      Wrote -> bumpUsed keys# cap >> pure PlacedFresh
-                      _ -> go slot steps
+                  else if not haveFresh
+                    then pure NeedCell
+                    else do
+                      claim <- claimAndPublish keys# slot k key (writeCell cells# slot fresh >> pure True)
+                      case claim of
+                        Wrote -> bumpUsed keys# cap >> pure PlacedFresh
+                        _ -> go slot steps
               else if (k .&. keyMask) == key && not (isTombstone k)
                 then
                   if k .&. claimingBit /= 0
@@ -1276,14 +1340,17 @@ placeIn overwrite keys# cells# cap key val fresh = go (slotFor cap key) 0
                                 _ -> go slot steps
                           | overwrite -> writeIORef ref val >> pure (PlacedExisting ref)
                           | otherwise -> pure (PlacedExisting ref)
-                        Nothing -> do
-                          -- The thread is gone but its slot is still here
-                          -- (an OnThread write for a finished thread). Give
-                          -- it the new cell, if no other writer has yet.
-                          claim <- claimAndPublish keys# slot k key (casCell cells# slot cell fresh)
-                          case claim of
-                            Wrote -> pure PlacedFresh
-                            _ -> go slot steps
+                        Nothing
+                          | not haveFresh -> pure NeedCell
+                          | otherwise -> do
+                              -- The thread is gone but its slot is still
+                              -- here (an OnThread write for a finished
+                              -- thread). Give it the new cell, if no other
+                              -- writer has yet.
+                              claim <- claimAndPublish keys# slot k key (casCell cells# slot cell fresh)
+                              case claim of
+                                Wrote -> pure PlacedFresh
+                                _ -> go slot steps
                 else go ((slot + 1) .&. mask) (steps + 1)
 
 
@@ -1341,13 +1408,22 @@ tombstoneSlot keys# cells# dead slot observed = do
 -- Internal: rehash
 ---------------------------------------------------------------------------
 
--- | Capacity after an insert found the table full: the same, if fewer than
--- half the slots hold live entries (the rest are tombstones or dead
--- threads), otherwise double.
+-- | Capacity after an insert found the table full. It doubles if at least
+-- half the slots hold running threads. Otherwise the table is full of
+-- tombstones and finished threads, which is thread churn: it still
+-- doubles up to 'churnCapacity', so that a rehash (and the writers it
+-- blocks) comes every few hundred inserts rather than every few dozen,
+-- and stays the same size beyond that, which bounds the finished
+-- threads' cells a table holds between rehashes.
 growCapacity :: Int -> Int -> Int
 growCapacity oldCap live
-  | live * 2 < oldCap = oldCap
+  | live * 2 < oldCap && oldCap >= churnCapacity = oldCap
   | otherwise = oldCap * 2
+
+
+-- | See 'growCapacity'.
+churnCapacity :: Int
+churnCapacity = 1024
 
 
 -- | Copy the current table's live entries into a new table and publish it.
@@ -1362,8 +1438,13 @@ growCapacity oldCap live
 -- the new table. Readers ignore the bit, so they keep finding entries in
 -- the old table until they next read 'tableRef'.
 --
--- Slots whose thread is gone (dead cell) are not copied, so a rehash is
--- also the sweep that reclaims them.
+-- Slots whose thread has finished or is gone are not copied, so a rehash
+-- is also the sweep that reclaims them, and the new capacity is chosen
+-- from running threads only. Counting every cell the GC has not yet
+-- killed would count each thread that finished since the last major GC
+-- (a TSO promoted to the old generation is only found dead by a major
+-- GC), and under thread churn that grew the table, and with it the dead
+-- cells it holds, several times over.
 rehash :: ThreadStorageMap a -> (Int -> Int -> Int) -> IO ()
 rehash (ThreadStorageMap tableRef _) chooseCap = do
   Table oldCap keys# cells# dead <- readIORef tableRef
@@ -1388,26 +1469,33 @@ rehash (ThreadStorageMap tableRef _) chooseCap = do
         if k' == emptySlot
           then writeKeyPrivate newKeys# slot k >> writeCell newCells# slot cell
           else place k cell ((slot + 1) .&. newMask)
-      copy !i
-        | i >= oldCap = pure ()
+      -- A thread can finish between the freeze and the copy, so the copy
+      -- recounts.
+      copy !i !n
+        | i >= oldCap = pure n
         | otherwise = do
             (k, CellRef cell) <- readSlot keys# cells# i
             alive <- slotLive k cells# i
-            when alive $ place (k .&. complement frozenBit) cell (slotFor newCap (k .&. keyMask))
-            copy (i + 1)
-  copy 0
-  writeKeyPrivate newKeys# newCap (fromIntegral live)
+            if alive
+              then do
+                place (k .&. complement frozenBit) cell (slotFor newCap (k .&. keyMask))
+                copy (i + 1) (n + 1)
+              else copy (i + 1) n
+  copied <- copy 0 (0 :: Int)
+  writeKeyPrivate newKeys# newCap (fromIntegral copied)
   writeIORef tableRef newTable
 
 
--- | Does a (frozen) slot hold an entry whose thread is still alive?
+-- | Does a (frozen) slot hold an entry whose owning thread is still
+-- running? Unlike 'purgeDeadThreads', this keeps an entry written under
+-- a raw key that is not its owner's ID, for as long as the owner runs.
 slotLive :: Key -> Exts.MutableArray# RealWorld (Cell a) -> Int -> IO Bool
 slotLive k cells# i
   | not (hasEntry k) || isTombstone k = pure False
   | otherwise = do
       CellRef cell <- readCellRef cells# i
-      IO $ \s -> case Exts.deRefWeak# cell s of
-        (# s', alive#, _ #) -> (# s', isTrue# (alive# ==# 1#) #)
+      IO $ \s -> case cellOwner# cell s of
+        (# s', status#, _ #) -> (# s', isTrue# (status# ==# 1#) #)
 {-# INLINE slotLive #-}
 
 
